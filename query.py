@@ -1,7 +1,8 @@
 import os
+import pickle
 import google.generativeai as genai
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain_google_genai import GoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -14,20 +15,18 @@ GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
 if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY environment variable is not set")
 
-
 # Set up Gemini API
 genai.configure(api_key=GOOGLE_API_KEY)
 
-# Load the existing embeddings model
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# Load FAISS vector store
+faiss_index_path = "./faiss_index/faiss_store.pkl"
+with open(faiss_index_path, "rb") as f:
+    vectorstore = pickle.load(f)
 
-# Load the existing vector store
-vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
-
-# Create retriever
+# Create retriever with optimized settings
 retriever = vectorstore.as_retriever(
     search_type="similarity",
-    search_kwargs={"k": 2}
+    search_kwargs={"k": 3}  # Fetch more chunks for better answers
 )
 
 # Set up Gemini and chain
@@ -62,7 +61,6 @@ class ConversationalQA:
             "input": query
         })
 
-        
         # Store question and answer in history
         self.history.append(f"Q: {query}\nA: {response['answer']}")
         

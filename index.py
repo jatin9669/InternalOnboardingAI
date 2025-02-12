@@ -10,11 +10,11 @@ import pickle
 faiss_index_path = "./faiss_index"
 
 # Delete existing FAISS index if it exists
-if os.path.exists(faiss_index_path):
-    shutil.rmtree(faiss_index_path)
+# if os.path.exists(faiss_index_path):
+#     shutil.rmtree(faiss_index_path)
 
 # Load and process PDF
-pdf_path = "./data.pdf"  # Update with actual PDF path
+pdf_path = "./KB/dynamo.pdf"  
 loader = PyMuPDFLoader(pdf_path)
 documents = loader.load()
 
