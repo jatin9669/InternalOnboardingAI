@@ -51,7 +51,12 @@ class ConversationalQA:
         # Keep last 5 exchanges for context
         history = "\n".join(self.history[-5:]) if self.history else "No previous conversation."
         
-        response = retrieval_chain.invoke({"history": history, "input": query})
+        response = retrieval_chain.invoke({
+            "history": history, 
+            "context": history,  # Merge history into context explicitly
+            "input": query
+        })
+
         
         # Store question and answer in history
         self.history.append(f"Q: {query}\nA: {response['answer']}")
