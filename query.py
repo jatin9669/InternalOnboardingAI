@@ -31,9 +31,7 @@ retriever = vectorstore.as_retriever(
 
 # Set up Gemini and chain
 llm = GoogleGenerativeAI(model="gemini-pro", google_api_key=GOOGLE_API_KEY)
-prompt = PromptTemplate.from_template("""You are an AI assistant. Answer the question as best as you can.
-If the provided context and conversation history don't contain enough information to answer the question, 
-provide a helpful response based on your general knowledge while mentioning that you're answering based on general knowledge rather than specific context.
+prompt = PromptTemplate.from_template("""You are an AI assistant. Answer the question as best as you can with the provided context and conversation history.
 
 Conversation History:
 {history}
@@ -42,6 +40,10 @@ Context: {context}
 Question: {input}
 
 Answer: """)
+
+# -prompt = PromptTemplate.from_template("""You are an AI assistant. Answer the question as best as you can.
+# -If the provided context and conversation history don't contain enough information to answer the question, 
+# -provide a helpful response based on your general knowledge while mentioning that you're answering based on general knowledge rather than specific context.
 
 # Create chains
 document_chain = create_stuff_documents_chain(llm, prompt)

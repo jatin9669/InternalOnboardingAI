@@ -1,2 +1,7 @@
 chroma_db
-
+faiss_index
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
