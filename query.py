@@ -6,9 +6,14 @@ from langchain_google_genai import GoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
+from dotenv import load_dotenv
 
 # Load environment variables
-GOOGLE_API_KEY = "AIzaSyCY6JDUfOrrLG_Qpin49gKnooBdwBK2f80"
+load_dotenv()
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable is not set")
+
 
 # Set up Gemini API
 genai.configure(api_key=GOOGLE_API_KEY)
