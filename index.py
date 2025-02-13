@@ -1,37 +1,42 @@
 import os
+import pickle
 import shutil
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
-import pickle
-# Define FAISS index path
-faiss_index_path = "./faiss_index"
+from dotenv import load_dotenv
 
-# Delete existing FAISS index if it exists
-# if os.path.exists(faiss_index_path):
-#     shutil.rmtree(faiss_index_path)
+# Load environment variables
+load_dotenv()
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable is not set")
 
-# Load and process PDF
-pdf_path = "./KB/dynamo.pdf"  
-loader = PyMuPDFLoader(pdf_path)
-documents = loader.load()
+# Define paths
+KB_FOLDER = "./KB"
+FAISS_INDEX_PATH = "./faiss_index/faiss_store.pkl"
 
-# Efficiently split text for retrieval
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1500,  # Large chunks retain better context
-    chunk_overlap=300
-)
-docs = text_splitter.split_documents(documents)
+# Function to process and index PDFs
+def process_pdfs():
+    documents = []
+    for file in os.listdir(KB_FOLDER):
+        if file.endswith(".pdf"):
+            pdf_path = os.path.join(KB_FOLDER, file)
+            loader = PyMuPDFLoader(pdf_path)
+            documents.extend(loader.load())
 
-# Generate embeddings
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=300)
+    docs = text_splitter.split_documents(documents)
 
-# Create FAISS vector store
-vectorstore = FAISS.from_documents(docs, embeddings)
+    embeddings = OpenAIEmbeddings(model="text-embedding-ada-002", openai_api_key=OPENAI_API_KEY)
+    vectorstore = FAISS.from_documents(docs, embeddings)
+    
+    # Save FAISS index
+    with open(FAISS_INDEX_PATH, "wb") as f:
+        pickle.dump(vectorstore, f)
+    
+    print("PDFs successfully processed and indexed.")
 
-# Save FAISS index using pickle
-with open(f"{faiss_index_path}/faiss_store.pkl", "wb") as f:
-    pickle.dump(vectorstore, f)
-
-print("PDF successfully processed and stored in FAISS vector database.")
+if __name__ == "__main__":
+    process_pdfs()
