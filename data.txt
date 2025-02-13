@@ -16,3 +16,9 @@ I am a game developer
 I am a data scientist
 I am a machine learning engineer
 I am a deep learning engineer
+I am a data engineer
+I am a data analyst
+I am a data scientist
+I am a data analyst
+I am a data scientist
+I am a data analyst
