@@ -26,12 +26,12 @@ with open(faiss_index_path, "rb") as f:
 # Create retriever with optimized settings
 retriever = vectorstore.as_retriever(
     search_type="similarity",
-    search_kwargs={"k": 5}  # Fetch more chunks for better answers
+    search_kwargs={"k": 10}  # Fetch more chunks for better answers
 )
 
 # Set up Gemini and chain
 llm = GoogleGenerativeAI(model="gemini-pro", google_api_key=GOOGLE_API_KEY)
-prompt = PromptTemplate.from_template("""You are an AI assistant. Answer the question as best as you can only with the provided context and conversation history.
+prompt = PromptTemplate.from_template("""You are an AI assistant. Answer the question as best as you can only with the provided context and conversation history. and answer in steps
 
 Conversation History:
 {history}

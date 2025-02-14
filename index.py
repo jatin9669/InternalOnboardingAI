@@ -4,6 +4,7 @@ from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import DirectoryLoader
 import pickle
 # Define FAISS index path
 faiss_index_path = "./faiss_index"
@@ -14,13 +15,17 @@ faiss_index_path = "./faiss_index"
 
 # Load and process PDF
 pdf_path = "./KB/dynamo.pdf"  
-loader = PyMuPDFLoader(pdf_path)
+loader = DirectoryLoader(
+    './data_files', 
+    glob="**/*.pdf",
+    loader_cls=PyMuPDFLoader
+)
 documents = loader.load()
 
 # Efficiently split text for retrieval
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1500,  # Large chunks retain better context
-    chunk_overlap=300
+    chunk_size=1700,  # Large chunks retain better context
+    chunk_overlap=400
 )
 docs = text_splitter.split_documents(documents)
 
