@@ -4,9 +4,11 @@ import google.generativeai as genai
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import GoogleGenerativeAI
-from langchain_core.prompts import PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
+from langchain.chains import create_history_aware_retriever
+from langchain_core.prompts import MessagesPlaceholder
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -26,48 +28,48 @@ with open(faiss_index_path, "rb") as f:
 # Create retriever with optimized settings
 retriever = vectorstore.as_retriever(
     search_type="similarity",
-    search_kwargs={"k": 10}  # Fetch more chunks for better answers
+    search_kwargs={"k": 5}  # Fetch more chunks for better answers
 )
 
 # Set up Gemini and chain
 llm = GoogleGenerativeAI(model="gemini-pro", google_api_key=GOOGLE_API_KEY)
-prompt = PromptTemplate.from_template("""You are an AI assistant. Answer the question as best as you can only with the provided context and conversation history. and answer in steps
 
-Conversation History:
-{history}
+# template
+template_for_answer = """Answer the following question based on the provided context with proper citations.
+<context>
+{context}
+</context>
 
-Context: {context}
-Question: {input}
+Question:{input}
+"""
+prompt_for_history = ChatPromptTemplate.from_messages([
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("user", "{input}"),
+    ("user", "Given the above conversation, generate a search query to look up in order to get information relevant to the conversation")
+])
 
-Answer: """)
-
-# -prompt = PromptTemplate.from_template("""You are an AI assistant. Answer the question as best as you can.
-# -If the provided context and conversation history don't contain enough information to answer the question, 
-# -provide a helpful response based on your general knowledge while mentioning that you're answering based on general knowledge rather than specific context.
+answer_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Answer the user's questions based on the below context:\n\n{context}"),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("user", "{input}")
+])
 
 # Create chains
-document_chain = create_stuff_documents_chain(llm, prompt)
+document_chain = create_stuff_documents_chain(llm, answer_prompt)
 retrieval_chain = create_retrieval_chain(retriever, document_chain)
+history_retriever_chain = create_history_aware_retriever(llm,retriever,prompt_for_history)
+
+conversational_retrieval_chain = create_retrieval_chain(history_retriever_chain, document_chain)
 
 class ConversationalQA:
     def __init__(self):
         self.history = []  # Stores conversation history
 
     def ask_question(self, query):
-        # Keep last 5 exchanges for context
-        history = "\n".join(self.history[-5:]) if self.history else "No previous conversation."
-        
-        response = retrieval_chain.invoke({
-            "history": history, 
-            "context": history,  # Merge history into context explicitly
-            "input": query
-        })
-
-        # Store question and answer in history
+        response = conversational_retrieval_chain.invoke({'chat_history': self.history, 'input': query})
         self.history.append(f"Q: {query}\nA: {response['answer']}")
-        
         return response["answer"]
-
+          
 # Interactive loop with memory
 if __name__ == "__main__":
     chat = ConversationalQA()
