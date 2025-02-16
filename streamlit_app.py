@@ -62,7 +62,7 @@ def setup_qa_chain(vectorstore):
         search_kwargs={"k": 5}
     )
 
-    # Create prompts
+    # Create promptsNo
     prompt_for_history = ChatPromptTemplate.from_messages([
         MessagesPlaceholder(variable_name="chat_history"),
         ("user", "{input}"),
