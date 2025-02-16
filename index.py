@@ -25,7 +25,7 @@ documents = loader.load()
 
 # Efficiently split text for retrieval
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1700,  # Large chunks retain better context
+    chunk_size=2000,  # Large chunks retain better context
     chunk_overlap=400
 )
 docs = text_splitter.split_documents(documents)
