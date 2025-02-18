@@ -49,14 +49,13 @@ prompt_for_history = ChatPromptTemplate.from_messages([
 ])
 
 answer_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Answer the user's questions based on the below context:\n\n{context}"),
+    ("system", "Answer the user's questions based on the below context with proper citations:\n\n{context}"),
     MessagesPlaceholder(variable_name="chat_history"),
     ("user", "{input}")
 ])
 
 # Create chains
 document_chain = create_stuff_documents_chain(llm, answer_prompt)
-retrieval_chain = create_retrieval_chain(retriever, document_chain)
 history_retriever_chain = create_history_aware_retriever(llm,retriever,prompt_for_history)
 
 conversational_retrieval_chain = create_retrieval_chain(history_retriever_chain, document_chain)
