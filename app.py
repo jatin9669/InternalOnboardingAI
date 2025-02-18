@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import re
 import fitz  # PyMuPDF for PDF processing
 import pdfplumber  # For table extraction
 from langchain_community.document_loaders import PyMuPDFLoader
@@ -11,8 +12,9 @@ from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 import tempfile
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-import re
-
+from logger import LoggingCallbacks
+from excel import write_to_excel
+import tiktoken
 # Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
@@ -22,6 +24,15 @@ st.session_state.setdefault('processed_pdfs', False)
 st.session_state.setdefault('chat_history', [])
 st.session_state.setdefault('qa_chain', None)
 st.session_state.setdefault('vectorstore', None)
+
+def count_tokens(text, model="text-embedding-3-small"):
+    """Counts tokens in a given text using OpenAI's tokenizer."""
+    encoding = tiktoken.encoding_for_model(model)
+    return len(encoding.encode(text))
+
+def calculate_cost(total_tokens):
+    """Calculates the cost of the query based on the total tokens."""
+    return (total_tokens / 1000) * 0.00002
 
 def extract_text_and_tables(pdf_path):
     """Extract text, hyperlinks, and tables from a PDF."""
@@ -64,6 +75,13 @@ def process_pdfs(uploaded_files):
     )
     splits = text_splitter.split_documents(documents)
     
+    total_tokens = 0
+    for split in splits:
+        total_tokens += count_tokens(split.page_content) # for processing pdfs
+    
+    estimated_cost = calculate_cost(total_tokens)
+    write_to_excel(total_tokens, "N/A", total_tokens, estimated_cost, "Embeddings")
+
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
     vectorstore = FAISS.from_documents(splits, embeddings)
     st.session_state.vectorstore = vectorstore  # Store FAISS globally
@@ -71,7 +89,7 @@ def process_pdfs(uploaded_files):
 
 def setup_qa_chain(vectorstore):
     """Set up the QA chain with FAISS retriever."""
-    llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
+    llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY, callbacks=[LoggingCallbacks()])
     retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
     prompt_for_history = ChatPromptTemplate.from_messages([
         MessagesPlaceholder(variable_name="chat_history"),
