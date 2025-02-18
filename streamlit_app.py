@@ -5,17 +5,17 @@ from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_google_genai import GoogleGenerativeAI
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from langchain.chains import create_history_aware_retriever
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 import tempfile
 from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 # Load environment variables
 load_dotenv()
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
 # Initialize session state
 if 'processed_pdfs' not in st.session_state:
@@ -43,18 +43,20 @@ def process_pdfs(uploaded_files):
     )
     splits = text_splitter.split_documents(documents)
 
+#     embeddings = HuggingFaceEmbeddings(
+# -        model_name="sentence-transformers/all-MiniLM-L6-v2"
+# -    )
     # Create embeddings and vectorstore
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
     vectorstore = FAISS.from_documents(splits, embeddings)
-    
     return vectorstore
 
 def setup_qa_chain(vectorstore):
     """Set up the QA chain with the vectorstore"""
+
+    #llm = GoogleGenerativeAI(model="gemini-pro", google_api_key=GOOGLE_API_KEY)
     # Initialize LLM
-    llm = GoogleGenerativeAI(model="gemini-pro", google_api_key=GOOGLE_API_KEY)
+    llm = ChatOpenAI(model="gpt-4o-mini", api_key=OPENAI_API_KEY)
     
     # Set up retriever
     retriever = vectorstore.as_retriever(
@@ -126,7 +128,7 @@ def main():
             st.write(message["content"])
 
     # Chat input
-    if prompt := st.chat_input("Ask a question about your documents..."):
+    if prompt := st.chat_input("Ask a question about your dorcuments..."):
         # Add user message to chat
         with st.chat_message("user"):
             st.write(prompt)
