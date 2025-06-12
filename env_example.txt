@@ -1,7 +1,3 @@
-# OpenAI API Configuration
-OPENAI_API_KEY=your_openai_api_key_here
-
-# Google OAuth Configuration
-# Get these from Google Cloud Console -> APIs & Services -> Credentials
-GOOGLE_CLIENT_ID=your_google_client_id.apps.googleusercontent.com
-GOOGLE_CLIENT_SECRET=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 
+OPENAI_API_KEY = "sk-rHBfFC2KgtNhk69NxGEkuLafC3P1Xhoeq2OkgPyru42rCBfn"
+GOOGLE_CLIENT_ID="739313191960-9udvge85q29uek20nauf9kap9mk9kp9v.apps.googleusercontent.com"
+GOOGLE_CLIENT_SECRET="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"
