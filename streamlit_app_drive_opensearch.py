@@ -23,6 +23,11 @@ from google_auth_oauthlib.flow import Flow
 import hashlib
 import json
 from datetime import datetime
+import uuid
+import base64
+from PIL import Image
+import io
+from image_processor import init_gemini, process_pdf_images
 
 # Load environment variables
 load_dotenv()
@@ -306,6 +311,9 @@ def load_processed_files_metadata(user_email):
 def process_all_user_pdfs(credentials, user_email):
     """Process all PDF files from user's Google Drive with smart incremental updates."""
     
+    # Initialize Gemini Vision model
+    model = init_gemini(GOOGLE_API_KEY)
+    
     # Always scan the drive first to check for new files
     st.session_state.processing_status = "🔍 Scanning your Google Drive..."
     pdf_files, service = scan_entire_drive_for_pdfs(credentials)
@@ -340,7 +348,28 @@ def process_all_user_pdfs(credentials, user_email):
     # If no new or updated files, just return existing vectorstore
     if not files_to_process:
         st.info(f"📚 No new documents to process ({len(processed_files_map)} files already processed)")
-        return st.session_state.vectorstore
+        
+        # Create vectorstore for existing documents
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=GOOGLE_API_KEY
+        )
+        
+        # Create vector store for existing documents
+        vectorstore = OpenSearchVectorSearch(
+            embedding_function=embeddings,
+            opensearch_url=OPENSEARCH_URL,
+            index_name=OPENSEARCH_INDEX,
+            http_auth=(OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD) if OPENSEARCH_USERNAME else None,
+            use_ssl=OPENSEARCH_URL.startswith('https'),
+            verify_certs=False,
+            engine="lucene"
+        )
+        
+        # Store vectorstore in session state
+        st.session_state.vectorstore = vectorstore
+        
+        return vectorstore
     
     # Process new/updated files
     if files_to_process:
@@ -372,7 +401,7 @@ def process_all_user_pdfs(credentials, user_email):
                         # Extract text with links
                         extracted_pages = extract_text_with_links(pdf_path)
                         
-                        # Process each page
+                        # Process text documents
                         from langchain_core.documents import Document
                         for page in extracted_pages:
                             combined_text = page["text"] + "\n\n🔗 Links:\n" + "\n".join(page["links"])
@@ -382,9 +411,29 @@ def process_all_user_pdfs(credentials, user_email):
                                 "file_id": file_id,
                                 "drive_link": file_info.get('webViewLink', ''),
                                 "modified_time": file_info.get('modifiedTime', ''),
-                                "user_email": user_email
+                                "user_email": user_email,
+                                "type": "text"
                             }
                             documents.append(Document(page_content=combined_text, metadata=metadata))
+                        
+                        # Process images using Gemini Vision
+                        print(f"Starting image processing for {file_name}")
+                        image_results = process_pdf_images(pdf_path, model)
+                        print(f"Image processing completed for {file_name}: {len(image_results)} results")
+                        
+                        for img_result in image_results:
+                            metadata = {
+                                "source": file_name,
+                                "page": img_result["page"],
+                                "file_id": file_id,
+                                "image_id": img_result["image_id"],
+                                "drive_link": file_info.get('webViewLink', ''),
+                                "modified_time": file_info.get('modifiedTime', ''),
+                                "user_email": user_email,
+                                "type": "image"
+                            }
+                            documents.append(Document(page_content=img_result["description"], metadata=metadata))
+                            print(f"Added image document: {img_result['image_id']}")
                         
                         processed_count += 1
                     else:
@@ -406,16 +455,28 @@ def process_all_user_pdfs(credentials, user_email):
         st.success(f"✅ Successfully processed {processed_count} files ({failed_count} failed)")
         st.info("🧠 Creating embeddings...")
         
-        # Split documents
+        # Separate text and image documents
+        text_docs = [doc for doc in documents if doc.metadata.get('type') == 'text']
+        image_docs = [doc for doc in documents if doc.metadata.get('type') == 'image']
+        
+        print(f"Processing {len(text_docs)} text documents and {len(image_docs)} image documents")
+        
+        # Split only text documents (don't split image descriptions)
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=2000,
             chunk_overlap=500,
             separators=["\n\n", "\n", " ", ""],
             keep_separator=True
         )
-        splits = text_splitter.split_documents(documents)
+        text_splits = text_splitter.split_documents(text_docs)
         
-        st.info(f"📊 Created {len(splits)} text chunks from new/updated documents")
+        # Keep image documents as-is (no splitting)
+        image_splits = image_docs
+        
+        # Combine all splits
+        all_splits = text_splits + image_splits
+        
+        st.info(f"📊 Created {len(text_splits)} text chunks from {len(text_docs)} text documents and {len(image_splits)} image descriptions")
         
         # Create embeddings using Gemini
         embeddings = GoogleGenerativeAIEmbeddings(
@@ -440,9 +501,10 @@ def process_all_user_pdfs(credentials, user_email):
         )
 
         # Add documents to vector store
-        vectorstore.add_documents(splits)
+        print(f"Adding {len(all_splits)} total documents to vector store")
+        vectorstore.add_documents(all_splits)
         
-        st.session_state.vectorstore = vectorstore  # Store vector store globally
+        st.session_state.vectorstore = vectorstore
         
         # Update processed files metadata
         updated_metadata = {
@@ -461,6 +523,7 @@ def process_all_user_pdfs(credentials, user_email):
         save_processed_files_metadata(updated_metadata, user_email)
         
         st.success("🎉 Your document collection is up to date!")
+        st.info(f"📊 Summary: {len(text_docs)} text documents and {len(image_docs)} images processed")
         return vectorstore
     
     return None
@@ -488,12 +551,38 @@ def setup_qa_chain(vectorstore):
 
     # Define answer prompt (force LLM to include links)
     answer_prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a helpful technical assistant. Provide clear, accurate answers based on the documentation.
-        - If the context contains URLs, **always include them**.
-        - Format URLs as proper clickable links.
-        - If referring to a specific section with a link, mention both the section name and the link.
+        ("system", """You are a helpful technical assistant with access to both text documents and image descriptions from PDFs. 
 
-        Context: {context}"""),
+**IMPORTANT GUIDELINES:**
+- If the context contains URLs, **always include them**.
+- Format URLs as proper clickable links.
+- If referring to a specific section with a link, mention both the section name and the link.
+- You have access to both text content and image descriptions from the documents.
+- **ALWAYS check image descriptions when answering questions** - they contain valuable visual information.
+- When answering questions about images, use the image descriptions and metadata available.
+- If someone asks about visual content, diagrams, charts, logos, or any visual elements, prioritize image descriptions.
+- Always cite your sources by mentioning the document name and type (text/image).
+- If the question is about visual content but no relevant images are found, mention this.
+
+**CONTEXT ANALYSIS:**
+- Text chunks: {text_chunks}
+- Image chunks: {image_chunks}
+- Total chunks: {total_chunks}
+
+**IMAGE-RELATED KEYWORDS TO WATCH FOR:**
+- "image", "picture", "photo", "screenshot", "diagram", "chart", "graph", "logo", "icon"
+- "visual", "appearance", "look like", "show", "display", "depict", "illustrate"
+- "dashboard", "interface", "UI", "layout", "design", "mockup", "wireframe"
+- "color", "style", "format", "size", "dimensions", "resolution"
+
+**When responding:**
+1. First check if there are relevant image descriptions
+2. Use both text and image information to provide comprehensive answers
+3. If images are mentioned, describe what they show based on the image descriptions
+4. Always mention the source document and whether information came from text or images
+5. If the question contains image-related keywords, prioritize image descriptions in your response
+
+Context: {context}"""),
         MessagesPlaceholder(variable_name="chat_history"),
         ("user", "{input}")
     ])
@@ -569,6 +658,7 @@ def main():
             **This AI assistant will:**
             - 🔍 Scan your entire Google Drive for PDF documents
             - 🧠 Create embeddings from all your documents
+            - 🖼️ Extract and describe images from your PDFs
             - 💬 Let you chat with your personal document collection
             - 🔒 Keep your data secure and private
             
@@ -627,6 +717,11 @@ def main():
         else:
             st.success("✅ Documents processed and ready!")
             
+            # Add a button to go to chat
+            if st.button("💬 Go to Chat", type="primary"):
+                st.session_state.processed_pdfs = True
+                st.rerun()
+            
             if st.button("🔄 Refresh Documents"):
                 user_email = st.session_state.user_info.get('email')
                 # Clear existing metadata
@@ -650,9 +745,10 @@ def main():
         
         1. **🔍 Document Discovery**: We'll scan your entire Google Drive for PDF files
         2. **📄 Text Extraction**: Extract text content from all your PDFs
-        3. **🧠 AI Processing**: Create smart embeddings that understand your document content
-        4. **💾 Personal Database**: Build your personal knowledge base in OpenSearch
-        5. **💬 Chat Ready**: Start asking questions about any of your documents!
+        3. **🖼️ Image Processing**: Extract and describe images using Gemini Vision
+        4. **🧠 AI Processing**: Create smart embeddings that understand your document content
+        5. **💾 Personal Database**: Build your personal knowledge base in OpenSearch
+        6. **💬 Chat Ready**: Start asking questions about any of your documents!
         
         **Your data stays private** - we only read your documents to build your personal AI assistant.
         """)
@@ -679,15 +775,47 @@ def main():
         for i, doc in enumerate(retrieved_docs[:3]):  # Show first 3 chunks
             print(f"\nChunk {i+1}:\n", doc.page_content[:2000])  # First 2000 chars
 
+        # Debug: Show image chunks specifically
+        print("\n=== IMAGE CHUNKS ===")
+        image_chunks = [doc for doc in retrieved_docs if doc.metadata.get('type') == 'image']
+        print(f"Found {len(image_chunks)} image chunks in retrieved documents")
+        for i, doc in enumerate(image_chunks):
+            print(f"\nImage Chunk {i+1}:")
+            print(f"Source: {doc.metadata.get('source', 'Unknown')}")
+            print(f"Page: {doc.metadata.get('page', 'Unknown')}")
+            print(f"Image ID: {doc.metadata.get('image_id', 'Unknown')}")
+            print(f"Dimensions: {doc.metadata.get('width', 'Unknown')}x{doc.metadata.get('height', 'Unknown')}")
+            print(f"Content: {doc.page_content[:1000]}...")  # First 1000 chars of image description
+            print("---")
+
         # Generate response from LLM
         with st.chat_message("assistant"):
             with st.spinner("Searching OpenSearch and generating response..."):
                 try:
+                    # Analyze retrieved documents
+                    text_chunks = [doc for doc in retrieved_docs if doc.metadata.get('type') == 'text']
+                    image_chunks = [doc for doc in retrieved_docs if doc.metadata.get('type') == 'image']
+                    total_chunks = len(retrieved_docs)
+                    
+                    # Create context analysis for the prompt
+                    context_analysis = {
+                        "text_chunks": len(text_chunks),
+                        "image_chunks": len(image_chunks),
+                        "total_chunks": total_chunks
+                    }
+                    
                     formatted_history = [(msg["role"], msg["content"]) for msg in st.session_state.chat_history[:-1]]
-                    response = st.session_state.qa_chain.invoke({
+                    
+                    # Add context analysis to the input
+                    response_input = {
                         "chat_history": formatted_history,
-                        "input": prompt
-                    })
+                        "input": prompt,
+                        "text_chunks": context_analysis["text_chunks"],
+                        "image_chunks": context_analysis["image_chunks"],
+                        "total_chunks": context_analysis["total_chunks"]
+                    }
+                    
+                    response = st.session_state.qa_chain.invoke(response_input)
                     
                     # Display the response
                     st.write(response["answer"])
@@ -697,9 +825,23 @@ def main():
                     
                     # Show retrieved documents in expander
                     with st.expander("📚 Retrieved Documents from OpenSearch"):
+                        # Show summary of retrieved chunks
+                        st.write(f"**📊 Retrieved {len(retrieved_docs)} total chunks:**")
+                        st.write(f"  - 📄 Text chunks: {len(text_chunks)}")
+                        st.write(f"  - 🖼️ Image chunks: {len(image_chunks)}")
+                        st.write("---")
+                        
                         for i, doc in enumerate(retrieved_docs):
                             st.write(f"**Document {i+1}:**")
-                            st.write(doc.page_content[:500] + "...")
+                            st.write(f"**Source:** {doc.metadata.get('source', 'Unknown')}")
+                            st.write(f"**Type:** {doc.metadata.get('type', 'Unknown')}")
+                            if doc.metadata.get('page'):
+                                st.write(f"**Page:** {doc.metadata['page']}")
+                            if doc.metadata.get('type') == 'image':
+                                st.write(f"**Image ID:** {doc.metadata.get('image_id', 'Unknown')}")
+                                st.write(f"**Dimensions:** {doc.metadata.get('width', 'Unknown')}x{doc.metadata.get('height', 'Unknown')}")
+                                st.write(f"**Format:** {doc.metadata.get('format', 'Unknown')}")
+                            st.write(f"**Content:** {doc.page_content[:500]}...")
                             st.write("---")
                     
                 except Exception as e:
