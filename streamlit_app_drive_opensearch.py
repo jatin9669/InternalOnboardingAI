@@ -95,6 +95,56 @@ def create_opensearch_client():
         st.error(f"Failed to connect to OpenSearch: {str(e)}")
         return None
 
+def create_opensearch_index(client):
+    """Create OpenSearch index with proper mapping for vector search."""
+    try:
+        # Delete existing index if it exists
+        if client.indices.exists(index=OPENSEARCH_INDEX):
+            print(f"🗑️ Deleting existing index: {OPENSEARCH_INDEX}")
+            client.indices.delete(index=OPENSEARCH_INDEX)
+        
+        # Define the index mapping for vector search
+        index_mapping = {
+            "mappings": {
+                "properties": {
+                    "vector_field": {
+                        "type": "knn_vector",
+                        "dimension": 768,  # Gemini embedding dimension
+                        "method": {
+                            "name": "hnsw",
+                            "space_type": "cosinesimil",
+                            "engine": "lucene"
+                        }
+                    },
+                    "text": {
+                        "type": "text"
+                    },
+                    "metadata": {
+                        "type": "object"
+                    }
+                }
+            },
+            "settings": {
+                "index": {
+                    "knn": True,
+                    "knn.algo_param.ef_search": 100
+                }
+            }
+        }
+        
+        # Create the index
+        client.indices.create(
+            index=OPENSEARCH_INDEX,
+            body=index_mapping
+        )
+        
+        print(f"✅ Created OpenSearch index: {OPENSEARCH_INDEX}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error creating OpenSearch index: {str(e)}")
+        return False
+
 def extract_text_with_links(pdf_path):
     """Extract text and hyperlinks from a PDF."""
     doc = fitz.open(pdf_path)
@@ -201,7 +251,7 @@ def authenticate_with_google(callback_url):
             flow = st.session_state.oauth_flow
         
         # Validate callback URL format
-        if not callback_url.startswith('http://localhost:8501'):
+        if not isinstance(callback_url, str) or not callback_url.startswith('http://localhost:8501'):
             st.error("Invalid callback URL received.")
             return None, None
             
@@ -229,38 +279,66 @@ def authenticate_with_google(callback_url):
         return None, None
 
 def scan_entire_drive_for_pdfs(credentials):
-    """Scan user's entire Google Drive for PDF files."""
+    """Scan entire Google Drive for PDF files."""
     try:
         service = build('drive', 'v3', credentials=credentials)
         
-        st.session_state.processing_status = "📁 Scanning your Google Drive for PDF files..."
-        
-        # Query to find all PDF files in the user's drive
+        # Query to find all PDF files
         query = "mimeType='application/pdf' and trashed=false"
-        results = service.files().list(
-            q=query,
-            fields="nextPageToken, files(id, name, parents, size, modifiedTime, webViewLink)",
-            pageSize=1000  # Maximum allowed
-        ).execute()
         
-        files = results.get('files', [])
+        results = []
+        page_token = None
         
-        # Handle pagination if there are more files
-        while 'nextPageToken' in results:
-            results = service.files().list(
+        while True:
+            response = service.files().list(
                 q=query,
-                fields="nextPageToken, files(id, name, parents, size, modifiedTime, webViewLink)",
-                pageSize=1000,
-                pageToken=results['nextPageToken']
+                spaces='drive',
+                fields='nextPageToken, files(id, name, modifiedTime, size)',
+                pageToken=page_token
             ).execute()
-            files.extend(results.get('files', []))
+            
+            results.extend(response.get('files', []))
+            page_token = response.get('nextPageToken', None)
+            
+            if page_token is None:
+                break
         
-        st.session_state.processing_status = f"📊 Found {len(files)} PDF files in your Drive"
-        return files, service
-    
+        return results
+        
     except Exception as e:
-        st.error(f"Failed to scan Google Drive: {str(e)}")
-        return [], None
+        st.error(f"Error scanning Drive for PDFs: {str(e)}")
+        return []
+
+def scan_entire_drive_for_docs(credentials):
+    """Scan entire Google Drive for Google Docs files."""
+    try:
+        service = build('drive', 'v3', credentials=credentials)
+        
+        # Query to find all Google Docs files
+        query = "mimeType='application/vnd.google-apps.document' and trashed=false"
+        
+        results = []
+        page_token = None
+        
+        while True:
+            response = service.files().list(
+                q=query,
+                spaces='drive',
+                fields='nextPageToken, files(id, name, modifiedTime, size)',
+                pageToken=page_token
+            ).execute()
+            
+            results.extend(response.get('files', []))
+            page_token = response.get('nextPageToken', None)
+            
+            if page_token is None:
+                break
+        
+        return results
+        
+    except Exception as e:
+        st.error(f"Error scanning Drive for Google Docs: {str(e)}")
+        return []
 
 def download_pdf_from_drive(service, file_id, file_name, download_dir):
     """Download a single PDF file from Google Drive."""
@@ -277,6 +355,92 @@ def download_pdf_from_drive(service, file_id, file_name, download_dir):
         return file_path
     except Exception as e:
         print(f"Failed to download {file_name}: {str(e)}")
+        return None
+
+def download_google_doc_content(service, file_id, file_name):
+    """Download Google Doc content as text."""
+    try:
+        # Export Google Doc as plain text
+        request = service.files().export_media(
+            fileId=file_id,
+            mimeType='text/plain'
+        )
+        
+        # Download the content
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        
+        while done is False:
+            status, done = downloader.next_chunk()
+            if status:
+                print(f"Download {int(status.progress() * 100)}%")
+        
+        content = fh.getvalue().decode('utf-8')
+        
+        # Create a document object similar to PDF processing
+        from langchain_core.documents import Document
+        
+        doc = Document(
+            page_content=content,
+            metadata={
+                'source': file_name,
+                'type': 'text',
+                'file_id': file_id,
+                'file_type': 'google_doc',
+                'processed_time': datetime.now().isoformat()
+            }
+        )
+        
+        return doc
+        
+    except Exception as e:
+        st.error(f"Error downloading Google Doc {file_name}: {str(e)}")
+        return None
+
+def process_pdf_with_images(pdf_path, file_name, file_id):
+    """Process a PDF file to extract both text and images."""
+    try:
+        # Initialize Gemini Vision model
+        model = init_gemini(GOOGLE_API_KEY)
+        
+        documents = []
+        
+        # Extract text with links
+        extracted_pages = extract_text_with_links(pdf_path)
+        
+        # Process text documents
+        from langchain_core.documents import Document
+        for page in extracted_pages:
+            combined_text = page["text"] + "\n\n🔗 Links:\n" + "\n".join(page["links"])
+            metadata = {
+                "source": file_name,
+                "page": page["page"],
+                "file_id": file_id,
+                "type": "text"
+            }
+            documents.append(Document(page_content=combined_text, metadata=metadata))
+        
+        # Process images using Gemini Vision
+        print(f"Starting image processing for {file_name}")
+        image_results = process_pdf_images(pdf_path, model)
+        print(f"Image processing completed for {file_name}: {len(image_results)} results")
+        
+        for img_result in image_results:
+            metadata = {
+                "source": file_name,
+                "page": img_result["page"],
+                "file_id": file_id,
+                "image_id": img_result["image_id"],
+                "type": "image"
+            }
+            documents.append(Document(page_content=img_result["description"], metadata=metadata))
+            print(f"Added image document: {img_result['image_id']}")
+        
+        return documents
+        
+    except Exception as e:
+        print(f"Error processing PDF {file_name}: {str(e)}")
         return None
 
 def get_user_vectorstore_path(user_email):
@@ -308,152 +472,131 @@ def load_processed_files_metadata(user_email):
             return {}
     return {}
 
-def process_all_user_pdfs(credentials, user_email):
-    """Process all PDF files from user's Google Drive with smart incremental updates."""
-    
-    # Initialize Gemini Vision model
-    model = init_gemini(GOOGLE_API_KEY)
-    
-    # Always scan the drive first to check for new files
-    st.session_state.processing_status = "🔍 Scanning your Google Drive..."
-    pdf_files, service = scan_entire_drive_for_pdfs(credentials)
-    
-    if not pdf_files:
-        st.warning("No PDF files found in your Google Drive.")
-        return None
-    
-    # Load existing processed files metadata
-    processed_files_metadata = load_processed_files_metadata(user_email)
-    
-    # Create a map of currently processed files (file_id -> metadata)
-    processed_files_map = {item['file_id']: item for item in processed_files_metadata.get('files', [])}
-    
-    # Find new files that haven't been processed yet
-    new_files = []
-    updated_files = []
-    
-    for file_info in pdf_files:
-        file_id = file_info['id']
-        current_modified_time = file_info.get('modifiedTime', '')
+def process_all_user_documents(credentials, user_email):
+    """Process all PDF and Google Doc files for a user."""
+    try:
+        # Create OpenSearch client
+        client = create_opensearch_client()
+        if not client:
+            raise Exception("Failed to create OpenSearch client")
+
+        # Check if index exists, if not create it
+        if not client.indices.exists(index=OPENSEARCH_INDEX):
+            create_opensearch_index(client)
+
+        # Load previously processed files metadata
+        processed_files = load_processed_files_metadata(user_email)
         
-        if file_id not in processed_files_map:
-            # Completely new file
-            new_files.append(file_info)
-        elif processed_files_map[file_id].get('modified_time') != current_modified_time:
-            # File has been modified since last processing
-            updated_files.append(file_info)
-    
-    files_to_process = new_files + updated_files
-    
-    # If no new or updated files, just return existing vectorstore
-    if not files_to_process:
-        st.info(f"📚 No new documents to process ({len(processed_files_map)} files already processed)")
+        # Scan for PDFs and Google Docs
+        st.session_state.processing_status = "📁 Scanning your Google Drive for PDF and Google Doc files..."
         
-        # Create vectorstore for existing documents
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=GOOGLE_API_KEY
-        )
+        pdf_files = scan_entire_drive_for_pdfs(credentials)
+        doc_files = scan_entire_drive_for_docs(credentials)
         
-        # Create vector store for existing documents
-        vectorstore = OpenSearchVectorSearch(
-            embedding_function=embeddings,
-            opensearch_url=OPENSEARCH_URL,
-            index_name=OPENSEARCH_INDEX,
-            http_auth=(OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD) if OPENSEARCH_USERNAME else None,
-            use_ssl=OPENSEARCH_URL.startswith('https'),
-            verify_certs=False,
-            engine="lucene"
-        )
+        all_files = pdf_files + doc_files
+        st.session_state.processing_status = f"📊 Found {len(pdf_files)} PDF files and {len(doc_files)} Google Doc files in your Drive"
         
-        # Store vectorstore in session state
-        st.session_state.vectorstore = vectorstore
+        if not all_files:
+            st.warning("No PDF or Google Doc files found in your Google Drive.")
+            return
+
+        # Build Drive service
+        service = build('drive', 'v3', credentials=credentials)
         
-        return vectorstore
-    
-    # Process new/updated files
-    if files_to_process:
-        st.info(f"🔄 Processing {len(new_files)} new files and {len(updated_files)} updated files...")
-        
+        # Process files
         documents = []
         processed_count = 0
         failed_count = 0
         
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Create progress bar
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        # Process PDFs
+        for pdf_file in pdf_files:
+            file_id = pdf_file['id']
+            file_name = pdf_file['name']
             
-            for i, file_info in enumerate(files_to_process):
-                file_id = file_info['id']
-                file_name = file_info['name']
+            # Check if already processed
+            file_hash = hashlib.md5(f"{file_id}_{pdf_file.get('modifiedTime', '')}".encode()).hexdigest()
+            if file_hash in processed_files:
+                print(f"Skipping already processed PDF: {file_name}")
+                continue
+            
+            try:
+                st.session_state.processing_status = f"📄 Processing PDF: {file_name}"
                 
-                try:
-                    # Update progress
-                    progress = (i + 1) / len(files_to_process)
-                    progress_bar.progress(progress)
-                    status_text.text(f"Processing {i+1}/{len(files_to_process)}: {file_name}")
-                    
-                    # Download PDF
+                # Download PDF
+                with tempfile.TemporaryDirectory() as temp_dir:
                     pdf_path = download_pdf_from_drive(service, file_id, file_name, temp_dir)
+                    if not pdf_path:
+                        failed_count += 1
+                        continue
                     
-                    if pdf_path and os.path.exists(pdf_path):
-                        # Extract text with links
-                        extracted_pages = extract_text_with_links(pdf_path)
-                        
-                        # Process text documents
-                        from langchain_core.documents import Document
-                        for page in extracted_pages:
-                            combined_text = page["text"] + "\n\n🔗 Links:\n" + "\n".join(page["links"])
-                            metadata = {
-                                "source": file_name,
-                                "page": page["page"],
-                                "file_id": file_id,
-                                "drive_link": file_info.get('webViewLink', ''),
-                                "modified_time": file_info.get('modifiedTime', ''),
-                                "user_email": user_email,
-                                "type": "text"
-                            }
-                            documents.append(Document(page_content=combined_text, metadata=metadata))
-                        
-                        # Process images using Gemini Vision
-                        print(f"Starting image processing for {file_name}")
-                        image_results = process_pdf_images(pdf_path, model)
-                        print(f"Image processing completed for {file_name}: {len(image_results)} results")
-                        
-                        for img_result in image_results:
-                            metadata = {
-                                "source": file_name,
-                                "page": img_result["page"],
-                                "file_id": file_id,
-                                "image_id": img_result["image_id"],
-                                "drive_link": file_info.get('webViewLink', ''),
-                                "modified_time": file_info.get('modifiedTime', ''),
-                                "user_email": user_email,
-                                "type": "image"
-                            }
-                            documents.append(Document(page_content=img_result["description"], metadata=metadata))
-                            print(f"Added image document: {img_result['image_id']}")
-                        
+                    # Extract text and images
+                    pdf_docs = process_pdf_with_images(pdf_path, file_name, file_id)
+                    if pdf_docs:
+                        documents.extend(pdf_docs)
                         processed_count += 1
+                        
+                        # Save metadata
+                        processed_files[file_hash] = {
+                            'file_id': file_id,
+                            'file_name': file_name,
+                            'file_type': 'pdf',
+                            'processed_time': datetime.now().isoformat(),
+                            'document_count': len(pdf_docs)
+                        }
                     else:
                         failed_count += 1
                         
-                except Exception as e:
-                    failed_count += 1
-                    print(f"Failed to process {file_name}: {str(e)}")
-                    continue
+            except Exception as e:
+                print(f"Error processing PDF {file_name}: {str(e)}")
+                failed_count += 1
+        
+        # Process Google Docs
+        for doc_file in doc_files:
+            file_id = doc_file['id']
+            file_name = doc_file['name']
             
-            # Clear progress indicators
-            progress_bar.empty()
-            status_text.empty()
+            # Check if already processed
+            file_hash = hashlib.md5(f"{file_id}_{doc_file.get('modifiedTime', '')}".encode()).hexdigest()
+            if file_hash in processed_files:
+                print(f"Skipping already processed Google Doc: {file_name}")
+                continue
+            
+            try:
+                st.session_state.processing_status = f"📝 Processing Google Doc: {file_name}"
+                
+                # Download Google Doc content
+                doc = download_google_doc_content(service, file_id, file_name)
+                if doc:
+                    documents.append(doc)
+                    processed_count += 1
+                    
+                    # Save metadata
+                    processed_files[file_hash] = {
+                        'file_id': file_id,
+                        'file_name': file_name,
+                        'file_type': 'google_doc',
+                        'processed_time': datetime.now().isoformat(),
+                        'document_count': 1
+                    }
+                else:
+                    failed_count += 1
+                    
+            except Exception as e:
+                print(f"Error processing Google Doc {file_name}: {str(e)}")
+                failed_count += 1
         
         if not documents:
-            st.error("No documents were processed successfully.")
-            return None
-        
+            st.warning("No new documents to process.")
+            return
+
         st.success(f"✅ Successfully processed {processed_count} files ({failed_count} failed)")
         st.info("🧠 Creating embeddings...")
+        
+        # Create embeddings using Gemini (needed for semantic chunking)
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=GOOGLE_API_KEY
+        )
         
         # Separate text and image documents
         text_docs = [doc for doc in documents if doc.metadata.get('type') == 'text']
@@ -461,39 +604,182 @@ def process_all_user_pdfs(credentials, user_email):
         
         print(f"Processing {len(text_docs)} text documents and {len(image_docs)} image documents")
         
-        # Split only text documents (don't split image descriptions)
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=2000,
-            chunk_overlap=500,
-            separators=["\n\n", "\n", " ", ""],
-            keep_separator=True
-        )
-        text_splits = text_splitter.split_documents(text_docs)
+        # Advanced semantic chunking function using embeddings and similarity
+        def semantic_chunk_text(text, embeddings, chunk_size=1500, overlap=300, 
+                               initial_threshold=0.6, appending_threshold=0.8):
+            """Split text semantically using embeddings to find natural breakpoints"""
+            if len(text) <= chunk_size:
+                return [text]
+            
+            # Split into sentences first using multiple approaches
+            import re
+            sentences = []
+            
+            # Try multiple sentence splitting approaches
+            # 1. Split by periods followed by space and capital letter
+            period_splits = re.split(r'(?<=\.)\s+(?=[A-Z])', text)
+            
+            # 2. Split by other sentence endings
+            sentence_endings = re.split(r'(?<=[.!?])\s+', text)
+            
+            # Use the approach that gives more reasonable sentence lengths
+            if len(period_splits) > len(sentence_endings) and all(len(s) > 10 for s in period_splits):
+                sentences = period_splits
+            else:
+                sentences = sentence_endings
+            
+            # Clean up sentences
+            sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 10]
+            
+            if len(sentences) <= 1:
+                # Fallback to recursive splitting if no sentence breaks
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=chunk_size,
+                    chunk_overlap=overlap,
+                    separators=["\n\n\n", "\n\n", "\n", ". ", "! ", "? ", "; ", ": ", " ", ""],
+                    keep_separator=True
+                )
+                return text_splitter.split_text(text)
+            
+            # Generate embeddings for all sentences
+            print(f"Generating embeddings for {len(sentences)} sentences...")
+            sentence_embeddings = embeddings.embed_documents(sentences)
+            
+            # Calculate cosine similarity between consecutive sentences
+            import numpy as np
+            from sklearn.metrics.pairwise import cosine_similarity
+            
+            chunks = []
+            current_chunk = []
+            current_length = 0
+            
+            for i, (sentence, embedding) in enumerate(zip(sentences, sentence_embeddings)):
+                sentence_length = len(sentence)
+                
+                # Check if adding this sentence would exceed chunk size
+                if current_length + sentence_length > chunk_size and current_chunk:
+                    # Finalize current chunk
+                    chunks.append(' '.join(current_chunk))
+                    
+                    # Start new chunk with overlap (last few sentences)
+                    overlap_sentences = current_chunk[-2:] if len(current_chunk) >= 2 else current_chunk
+                    current_chunk = overlap_sentences.copy()
+                    current_length = sum(len(s) for s in current_chunk)
+                
+                # If this is the first sentence or we have a current chunk, check similarity
+                if current_chunk:
+                    # Calculate similarity with the last sentence in current chunk
+                    last_sentence_idx = i - 1
+                    if last_sentence_idx >= 0:
+                        last_embedding = sentence_embeddings[last_sentence_idx]
+                        similarity = cosine_similarity([last_embedding], [embedding])[0][0]
+                        
+                        # If similarity is low, start a new chunk (semantic breakpoint)
+                        if similarity < initial_threshold and current_length > chunk_size * 0.3:
+                            chunks.append(' '.join(current_chunk))
+                            current_chunk = [sentence]
+                            current_length = sentence_length
+                            continue
+                
+                # Add sentence to current chunk
+                current_chunk.append(sentence)
+                current_length += sentence_length
+            
+            # Add the final chunk
+            if current_chunk:
+                chunks.append(' '.join(current_chunk))
+            
+            # Post-process: merge very similar adjacent chunks
+            if len(chunks) > 1:
+                final_chunks = []
+                i = 0
+                while i < len(chunks):
+                    if i < len(chunks) - 1:
+                        # Check if we can merge with next chunk
+                        chunk1_embedding = embeddings.embed_documents([chunks[i]])[0]
+                        chunk2_embedding = embeddings.embed_documents([chunks[i + 1]])[0]
+                        similarity = cosine_similarity([chunk1_embedding], [chunk2_embedding])[0][0]
+                        
+                        if similarity > appending_threshold and len(chunks[i]) + len(chunks[i + 1]) <= chunk_size * 1.2:
+                            # Merge chunks
+                            merged_chunk = chunks[i] + " " + chunks[i + 1]
+                            final_chunks.append(merged_chunk)
+                            i += 2  # Skip next chunk
+                        else:
+                            final_chunks.append(chunks[i])
+                            i += 1
+                    else:
+                        final_chunks.append(chunks[i])
+                        i += 1
+                
+                chunks = final_chunks
+            
+            return chunks
         
-        # Keep image documents as-is (no splitting)
-        image_splits = image_docs
+        # Apply semantic chunking to text documents
+        text_splits = []
+        for doc in text_docs:
+            print(f"Semantically chunking document: {doc.metadata.get('source', 'unknown')}")
+            chunks = semantic_chunk_text(doc.page_content, embeddings)
+            for i, chunk in enumerate(chunks):
+                from langchain_core.documents import Document
+                chunk_doc = Document(
+                    page_content=chunk,
+                    metadata=doc.metadata.copy()
+                )
+                chunk_doc.metadata['chunk_id'] = i
+                chunk_doc.metadata['total_chunks'] = len(chunks)
+                chunk_doc.metadata['chunking_method'] = 'semantic'
+                text_splits.append(chunk_doc)
+        
+        # For image descriptions, group by source and page for better organization
+        image_splits = []
+        if image_docs:
+            # Group images by source and page
+            image_groups = {}
+            for img_doc in image_docs:
+                source = img_doc.metadata.get('source', 'unknown')
+                page = img_doc.metadata.get('page', 0)
+                key = f"{source}_page_{page}"
+                
+                if key not in image_groups:
+                    image_groups[key] = []
+                image_groups[key].append(img_doc)
+            
+            # Process each group semantically
+            for key, group_docs in image_groups.items():
+                if len(group_docs) == 1:
+                    # Single image, keep as-is
+                    image_splits.extend(group_docs)
+                else:
+                    # Multiple images on same page, combine and apply semantic chunking
+                    combined_content = "\n\n".join([doc.page_content for doc in group_docs])
+                    chunks = semantic_chunk_text(combined_content, embeddings, chunk_size=1000, overlap=200)
+                    
+                    for i, chunk in enumerate(chunks):
+                        from langchain_core.documents import Document
+                        chunk_doc = Document(
+                            page_content=chunk,
+                            metadata=group_docs[0].metadata.copy()
+                        )
+                        chunk_doc.metadata['image_count'] = len(group_docs)
+                        chunk_doc.metadata['image_ids'] = [doc.metadata.get('image_id', '') for doc in group_docs]
+                        chunk_doc.metadata['chunk_id'] = i
+                        chunk_doc.metadata['total_chunks'] = len(chunks)
+                        chunk_doc.metadata['chunking_method'] = 'semantic'
+                        image_splits.append(chunk_doc)
         
         # Combine all splits
         all_splits = text_splits + image_splits
         
-        st.info(f"📊 Created {len(text_splits)} text chunks from {len(text_docs)} text documents and {len(image_splits)} image descriptions")
+        st.info(f"📊 Created {len(text_splits)} semantic text chunks from {len(text_docs)} text documents and {len(image_splits)} semantic image chunks from {len(image_docs)} image descriptions")
         
-        # Create embeddings using Gemini
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=GOOGLE_API_KEY
-        )
-
-        # Create OpenSearch client
-        client = create_opensearch_client()
-        if not client:
-            raise Exception("Failed to create OpenSearch client")
-
         # Create vector store
         vectorstore = OpenSearchVectorSearch(
             embedding_function=embeddings,
             opensearch_url=OPENSEARCH_URL,
             index_name=OPENSEARCH_INDEX,
+            vector_field="vector_field",
             http_auth=(OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD) if OPENSEARCH_USERNAME else None,
             use_ssl=OPENSEARCH_URL.startswith('https'),
             verify_certs=False,
@@ -504,29 +790,18 @@ def process_all_user_pdfs(credentials, user_email):
         print(f"Adding {len(all_splits)} total documents to vector store")
         vectorstore.add_documents(all_splits)
         
+        # Save updated metadata
+        save_processed_files_metadata(processed_files, user_email)
+        
+        # Update session state
         st.session_state.vectorstore = vectorstore
+        st.session_state.qa_chain = setup_qa_chain(vectorstore)
+        st.session_state.processed_pdfs = True
+        st.session_state.processing_status = "✅ Processing complete! You can now ask questions about your documents."
         
-        # Update processed files metadata
-        updated_metadata = {
-            'files': [
-                {
-                    'file_id': file_info['id'],
-                    'file_name': file_info['name'],
-                    'modified_time': file_info.get('modifiedTime', ''),
-                    'processed_at': datetime.now().isoformat()
-                }
-                for file_info in pdf_files
-            ],
-            'last_scan': datetime.now().isoformat(),
-            'total_files': len(pdf_files)
-        }
-        save_processed_files_metadata(updated_metadata, user_email)
-        
-        st.success("🎉 Your document collection is up to date!")
-        st.info(f"📊 Summary: {len(text_docs)} text documents and {len(image_docs)} images processed")
-        return vectorstore
-    
-    return None
+    except Exception as e:
+        st.error(f"Error processing documents: {str(e)}")
+        st.session_state.processing_status = f"❌ Error: {str(e)}"
 
 def setup_qa_chain(vectorstore):
     """Set up the QA chain with OpenSearch retriever using Gemini."""
@@ -549,13 +824,14 @@ def setup_qa_chain(vectorstore):
         ("system", "Generate a search query based on the conversation history and question.")
     ])
 
-    # Define answer prompt (force LLM to include links)
+    # Define answer prompt (simplified to only use available variables)
     answer_prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a helpful technical assistant with access to both text documents and image descriptions from PDFs. 
 
 **IMPORTANT GUIDELINES:**
 - If the context contains URLs, **always include them**.
 - Format URLs as proper clickable links.
+- Never ever answer a question from your own knowledge.
 - If referring to a specific section with a link, mention both the section name and the link.
 - You have access to both text content and image descriptions from the documents.
 - **ALWAYS check image descriptions when answering questions** - they contain valuable visual information.
@@ -563,11 +839,6 @@ def setup_qa_chain(vectorstore):
 - If someone asks about visual content, diagrams, charts, logos, or any visual elements, prioritize image descriptions.
 - Always cite your sources by mentioning the document name and type (text/image).
 - If the question is about visual content but no relevant images are found, mention this.
-
-**CONTEXT ANALYSIS:**
-- Text chunks: {text_chunks}
-- Image chunks: {image_chunks}
-- Total chunks: {total_chunks}
 
 **IMAGE-RELATED KEYWORDS TO WATCH FOR:**
 - "image", "picture", "photo", "screenshot", "diagram", "chart", "graph", "logo", "icon"
@@ -583,7 +854,6 @@ def setup_qa_chain(vectorstore):
 5. If the question contains image-related keywords, prioritize image descriptions in your response
 
 Context: {context}"""),
-        MessagesPlaceholder(variable_name="chat_history"),
         ("user", "{input}")
     ])
 
@@ -595,257 +865,181 @@ Context: {context}"""),
 
 def main():
     st.set_page_config(
-        page_title="Personal AI Assistant",
-        page_icon="🤖",
+        page_title="AI Document Assistant",
+        page_icon="📚",
         layout="wide"
     )
-
-    st.title("🤖 Personal AI Assistant with Google Drive")
-
-    # Check if API keys are set
-    if not GOOGLE_API_KEY:
-        st.error("🔑 Please set your Google API key in the .env file!")
-        st.info("Edit the .env file and add your Gemini API key.")
-        return
-
-    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        st.error("🔑 Please set your Google OAuth credentials in the .env file!")
-        st.info("Edit the .env file and add your Google OAuth client ID and secret.")
-        return
-
-    # Check OpenSearch connection
-    client = create_opensearch_client()
-    if not client:
-        st.error("❌ Failed to connect to OpenSearch. Please check your OpenSearch configuration.")
-        st.info("Make sure OpenSearch is running and configured properly in your .env file.")
-        return
-
-    # Handle OAuth callback automatically
-    query_params = st.query_params
-    if 'code' in query_params and not st.session_state.authenticated:
-        st.info("🔄 Processing authentication...")
-        
-        # Construct the full callback URL
-        callback_url = f"http://localhost:8501?code={query_params['code']}"
-        if 'state' in query_params:
-            callback_url += f"&state={query_params['state']}"
-        if 'scope' in query_params:
-            callback_url += f"&scope={query_params['scope']}"
-            
-        # Process authentication
-        with st.spinner("Completing sign in..."):
-            credentials, user_info = authenticate_with_google(callback_url)
-            if credentials and user_info:
-                st.session_state.credentials = credentials
-                st.session_state.user_info = user_info
-                st.session_state.authenticated = True
-                st.success(f"Welcome, {user_info.get('name', 'User')}!")
-                # Clear query params and redirect to clean URL
-                st.query_params.clear()
-                st.rerun()
-            else:
-                st.error("Authentication failed. Please try again.")
-                st.query_params.clear()
-
-    # Check authentication
+    
+    st.title("🤖 AI Document Assistant")
+    st.markdown("Connect your Google Drive to process PDFs and Google Docs with semantic AI analysis")
+    
+    # Check if user is authenticated
     if not st.session_state.authenticated:
-        # Login page
-        st.markdown("### 🔐 Sign in with Google to access your documents")
+        st.markdown("### 🔐 Authentication Required")
+        st.markdown("Please authenticate with Google to access your Drive documents.")
         
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            st.markdown("""
-            **This AI assistant will:**
-            - 🔍 Scan your entire Google Drive for PDF documents
-            - 🧠 Create embeddings from all your documents
-            - 🖼️ Extract and describe images from your PDFs
-            - 💬 Let you chat with your personal document collection
-            - 🔒 Keep your data secure and private
+        # Google OAuth button
+        if st.button("🔑 Connect Google Drive", type="primary"):
+            auth_url = get_google_oauth_url()
+            if auth_url:
+                st.markdown(f"**Click the link below to authenticate:**")
+                st.markdown(f"[🔗 Authenticate with Google]({auth_url})")
+                st.info("After authentication, you'll be redirected back to this app.")
+            else:
+                st.error("Failed to generate authentication URL. Please check your Google OAuth configuration.")
+        
+        # Handle OAuth callback
+        query_params = st.query_params
+        if 'code' in query_params and not st.session_state.authenticated:
+            st.info("🔄 Processing authentication...")
             
-            **To get started:**
-            1. Click the button below to sign in with Google
-            2. Grant permissions to read your Google Drive
-            3. Wait while we process your documents
-            4. Start chatting with your AI assistant!
-            """)
+            # Extract the authorization code
+            code = query_params['code']
             
-            if st.button("🚀 Sign in with Google", type="primary", use_container_width=True):
-                try:
-                    auth_url = get_google_oauth_url()
-                    if auth_url:
-                        st.markdown(f"""
-                        **[🔗 Click here to authenticate with Google]({auth_url})**
-                        
-                        *You'll be redirected back automatically after signing in.*
-                        """)
-                        st.info("💡 After clicking the link above, you'll be taken to Google's sign-in page. Once you authorize the app, you'll be automatically redirected back here!")
-                except Exception as e:
-                    st.error(f"Error generating auth URL: {str(e)}")
+            # Construct the callback URL properly
+            callback_url = f"http://localhost:8501?code={code}"
+            if 'state' in query_params:
+                callback_url += f"&state={query_params['state']}"
+            if 'scope' in query_params:
+                callback_url += f"&scope={query_params['scope']}"
+            
+            # Process authentication
+            with st.spinner("Completing sign in..."):
+                credentials, user_info = authenticate_with_google(callback_url)
+                
+                if credentials and user_info:
+                    st.session_state.credentials = credentials
+                    st.session_state.user_info = user_info
+                    st.session_state.authenticated = True
+                    st.success("✅ Successfully authenticated with Google!")
+                    # Clear query params and redirect to clean URL
+                    st.query_params.clear()
+                    st.rerun()
+                else:
+                    st.error("❌ Authentication failed. Please try again.")
+                    st.query_params.clear()
+        
+        st.markdown("---")
+        st.markdown("### 📋 Setup Instructions")
+        st.markdown("""
+        1. **Google Cloud Setup**: Create a Google Cloud project and enable the Google Drive API
+        2. **OAuth Configuration**: Set up OAuth 2.0 credentials for a web application
+        3. **Environment Variables**: Add your Google OAuth credentials to your `.env` file:
+           ```
+           GOOGLE_OAUTH_CLIENT_ID=your_client_id
+           GOOGLE_OAUTH_CLIENT_SECRET=your_client_secret
+           GOOGLE_API_KEY=your_gemini_api_key
+           ```
+        4. **OpenSearch**: Ensure OpenSearch is running and accessible
+        """)
+        
         return
-
-    # User is authenticated - show main interface
+    
+    # User is authenticated
+    user_email = st.session_state.user_info.get('email', 'unknown')
+    st.success(f"👋 Welcome, {user_email}!")
+    
+    # Sidebar for controls
     with st.sidebar:
-        st.header("👤 User Profile")
-        if st.session_state.user_info:
-            st.write(f"**Name:** {st.session_state.user_info.get('name', 'Unknown')}")
-            st.write(f"**Email:** {st.session_state.user_info.get('email', 'Unknown')}")
-            
-            if st.button("🚪 Sign Out"):
-                # Clear all session state
-                for key in list(st.session_state.keys()):
-                    del st.session_state[key]
-                st.rerun()
+        st.header("📁 Document Processing")
         
-        st.divider()
+        # Force reprocess option
+        force_reprocess = st.checkbox("🔄 Force Reprocess All Documents", 
+                                    help="Clear existing data and reprocess all documents")
         
-        # Document processing section
-        st.header("📚 Document Processing")
-        
-        if not st.session_state.processed_pdfs:
-            st.info("Your documents haven't been processed yet.")
-            if st.button("🔄 Process My Google Drive", type="primary"):
-                user_email = st.session_state.user_info.get('email')
-                with st.spinner("Processing your Google Drive..."):
-                    try:
-                        vectorstore = process_all_user_pdfs(st.session_state.credentials, user_email)
-                        if vectorstore:
-                            st.session_state.qa_chain = setup_qa_chain(vectorstore)
-                            st.session_state.processed_pdfs = True
-                            st.rerun()
-                    except Exception as e:
-                        st.error(f"Error processing documents: {str(e)}")
-        else:
-            st.success("✅ Documents processed and ready!")
-            
-            # Add a button to go to chat
-            if st.button("💬 Go to Chat", type="primary"):
-                st.session_state.processed_pdfs = True
-                st.rerun()
-            
-            if st.button("🔄 Refresh Documents"):
-                user_email = st.session_state.user_info.get('email')
-                # Clear existing metadata
+        if force_reprocess:
+            if st.button("🗑️ Clear All Data", type="secondary"):
+                # Clear processed files metadata
                 metadata_path = get_user_metadata_path(user_email)
                 if os.path.exists(metadata_path):
                     os.remove(metadata_path)
                 
+                # Clear OpenSearch index
+                client = create_opensearch_client()
+                if client and client.indices.exists(index=OPENSEARCH_INDEX):
+                    client.indices.delete(index=OPENSEARCH_INDEX)
+                    st.success("✅ All data cleared!")
+                
                 st.session_state.processed_pdfs = False
                 st.session_state.vectorstore = None
+                st.session_state.qa_chain = None
                 st.rerun()
-            
-            if st.button("💬 Clear Chat History"):
-                st.session_state.chat_history = []
-                st.rerun()
-
-    # Main chat interface
-    if not st.session_state.processed_pdfs:
-        st.info("🔄 Please process your Google Drive documents to start chatting.")
+        
+        # Process documents button
+        if st.button("🚀 Process Documents", type="primary"):
+            with st.spinner("Processing your Google Drive..."):
+                try:
+                    process_all_user_documents(st.session_state.credentials, user_email)
+                except Exception as e:
+                    st.error(f"Error processing documents: {str(e)}")
+        
+        # Show processing status
+        if st.session_state.processing_status:
+            st.info(st.session_state.processing_status)
+        
+        st.markdown("---")
+        st.header("ℹ️ About")
         st.markdown("""
-        ### What happens when you process your Drive:
+        This app processes your Google Drive documents using:
         
-        1. **🔍 Document Discovery**: We'll scan your entire Google Drive for PDF files
-        2. **📄 Text Extraction**: Extract text content from all your PDFs
-        3. **🖼️ Image Processing**: Extract and describe images using Gemini Vision
-        4. **🧠 AI Processing**: Create smart embeddings that understand your document content
-        5. **💾 Personal Database**: Build your personal knowledge base in OpenSearch
-        6. **💬 Chat Ready**: Start asking questions about any of your documents!
+        - **Semantic Chunking**: Advanced AI-powered text splitting
+        - **Gemini Vision**: Image analysis and description
+        - **OpenSearch**: Vector storage and retrieval
+        - **Streamlit**: Interactive web interface
         
-        **Your data stays private** - we only read your documents to build your personal AI assistant.
+        Supports: PDF files and Google Docs
         """)
+    
+    # Main content area
+    if not st.session_state.processed_pdfs:
+        st.info("📚 No documents processed yet. Click 'Process Documents' in the sidebar to get started.")
         return
-
-    # Display chat history
-    for message in st.session_state.chat_history:
+    
+    # Chat interface
+    st.header("💬 Ask Questions About Your Documents")
+    
+    # Initialize chat history
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    
+    # Display chat messages
+    for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.write(message["content"])
-
+            st.markdown(message["content"])
+    
     # Chat input
     if prompt := st.chat_input("Ask a question about your documents..."):
-        # Add user message to chat
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Display user message
         with st.chat_message("user"):
-            st.write(prompt)
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-
-        # Retrieve documents from OpenSearch
-        retriever = st.session_state.vectorstore.as_retriever()
-        retrieved_docs = retriever.invoke(prompt)
-
-        # Debug retrieved chunks
-        print("\n=== Retrieved Chunks from OpenSearch ===")
-        for i, doc in enumerate(retrieved_docs[:3]):  # Show first 3 chunks
-            print(f"\nChunk {i+1}:\n", doc.page_content[:2000])  # First 2000 chars
-
-        # Debug: Show image chunks specifically
-        print("\n=== IMAGE CHUNKS ===")
-        image_chunks = [doc for doc in retrieved_docs if doc.metadata.get('type') == 'image']
-        print(f"Found {len(image_chunks)} image chunks in retrieved documents")
-        for i, doc in enumerate(image_chunks):
-            print(f"\nImage Chunk {i+1}:")
-            print(f"Source: {doc.metadata.get('source', 'Unknown')}")
-            print(f"Page: {doc.metadata.get('page', 'Unknown')}")
-            print(f"Image ID: {doc.metadata.get('image_id', 'Unknown')}")
-            print(f"Dimensions: {doc.metadata.get('width', 'Unknown')}x{doc.metadata.get('height', 'Unknown')}")
-            print(f"Content: {doc.page_content[:1000]}...")  # First 1000 chars of image description
-            print("---")
-
-        # Generate response from LLM
+            st.markdown(prompt)
+        
+        # Generate response
         with st.chat_message("assistant"):
-            with st.spinner("Searching OpenSearch and generating response..."):
-                try:
-                    # Analyze retrieved documents
-                    text_chunks = [doc for doc in retrieved_docs if doc.metadata.get('type') == 'text']
-                    image_chunks = [doc for doc in retrieved_docs if doc.metadata.get('type') == 'image']
-                    total_chunks = len(retrieved_docs)
+            message_placeholder = st.empty()
+            
+            try:
+                if st.session_state.qa_chain:
+                    # Get response from QA chain
+                    response = st.session_state.qa_chain.invoke({"input": prompt})
+                    answer = response.get("answer", "Sorry, I couldn't find an answer.")
                     
-                    # Create context analysis for the prompt
-                    context_analysis = {
-                        "text_chunks": len(text_chunks),
-                        "image_chunks": len(image_chunks),
-                        "total_chunks": total_chunks
-                    }
+                    # Display response
+                    message_placeholder.markdown(answer)
                     
-                    formatted_history = [(msg["role"], msg["content"]) for msg in st.session_state.chat_history[:-1]]
-                    
-                    # Add context analysis to the input
-                    response_input = {
-                        "chat_history": formatted_history,
-                        "input": prompt,
-                        "text_chunks": context_analysis["text_chunks"],
-                        "image_chunks": context_analysis["image_chunks"],
-                        "total_chunks": context_analysis["total_chunks"]
-                    }
-                    
-                    response = st.session_state.qa_chain.invoke(response_input)
-                    
-                    # Display the response
-                    st.write(response["answer"])
-                    
-                    # Add to chat history
-                    st.session_state.chat_history.append({"role": "assistant", "content": response["answer"]})
-                    
-                    # Show retrieved documents in expander
-                    with st.expander("📚 Retrieved Documents from OpenSearch"):
-                        # Show summary of retrieved chunks
-                        st.write(f"**📊 Retrieved {len(retrieved_docs)} total chunks:**")
-                        st.write(f"  - 📄 Text chunks: {len(text_chunks)}")
-                        st.write(f"  - 🖼️ Image chunks: {len(image_chunks)}")
-                        st.write("---")
-                        
-                        for i, doc in enumerate(retrieved_docs):
-                            st.write(f"**Document {i+1}:**")
-                            st.write(f"**Source:** {doc.metadata.get('source', 'Unknown')}")
-                            st.write(f"**Type:** {doc.metadata.get('type', 'Unknown')}")
-                            if doc.metadata.get('page'):
-                                st.write(f"**Page:** {doc.metadata['page']}")
-                            if doc.metadata.get('type') == 'image':
-                                st.write(f"**Image ID:** {doc.metadata.get('image_id', 'Unknown')}")
-                                st.write(f"**Dimensions:** {doc.metadata.get('width', 'Unknown')}x{doc.metadata.get('height', 'Unknown')}")
-                                st.write(f"**Format:** {doc.metadata.get('format', 'Unknown')}")
-                            st.write(f"**Content:** {doc.page_content[:500]}...")
-                            st.write("---")
-                    
-                except Exception as e:
-                    st.error(f"Error generating response: {str(e)}")
+                    # Add assistant response to chat history
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                else:
+                    message_placeholder.error("❌ QA chain not initialized. Please process documents first.")
+            except Exception as e:
+                message_placeholder.error(f"❌ Error generating response: {str(e)}")
+    
+    # Clear chat button
+    if st.button("🗑️ Clear Chat History"):
+        st.session_state.messages = []
+        st.rerun()
 
 if __name__ == "__main__":
     main() 
