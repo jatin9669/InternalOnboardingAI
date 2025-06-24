@@ -69,6 +69,8 @@ if 'vectorstore' not in st.session_state:
     st.session_state.vectorstore = None
 if 'processing_status' not in st.session_state:
     st.session_state.processing_status = ""
+if 'start_chatting' not in st.session_state:
+    st.session_state.start_chatting = False
 
 def create_opensearch_client():
     """Create OpenSearch client connection."""
@@ -143,6 +145,70 @@ def create_opensearch_index(client):
         
     except Exception as e:
         print(f"❌ Error creating OpenSearch index: {str(e)}")
+        return False
+
+def check_existing_documents():
+    """Check if there are existing documents in OpenSearch."""
+    try:
+        client = create_opensearch_client()
+        if not client:
+            return False
+        
+        # Check if index exists
+        if not client.indices.exists(index=OPENSEARCH_INDEX):
+            return False
+        
+        # Count documents in the index
+        count_response = client.count(index=OPENSEARCH_INDEX)
+        document_count = count_response.get('count', 0)
+        
+        return document_count > 0
+        
+    except Exception as e:
+        print(f"Error checking existing documents: {str(e)}")
+        return False
+
+def initialize_qa_chain_from_existing():
+    """Initialize QA chain from existing OpenSearch documents."""
+    try:
+        print("🔧 Starting QA chain initialization...")
+        
+        # Create embeddings
+        print("📝 Creating embeddings...")
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=GOOGLE_API_KEY
+        )
+        
+        # Create vector store connection to existing index
+        print("🔗 Connecting to OpenSearch vector store...")
+        vectorstore = OpenSearchVectorSearch(
+            embedding_function=embeddings,
+            opensearch_url=OPENSEARCH_URL,
+            index_name=OPENSEARCH_INDEX,
+            vector_field="vector_field",
+            http_auth=(OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD) if OPENSEARCH_USERNAME else None,
+            use_ssl=OPENSEARCH_URL.startswith('https'),
+            verify_certs=False,
+            engine="lucene"
+        )
+        
+        # Set up QA chain
+        print("⚙️ Setting up QA chain...")
+        qa_chain = setup_qa_chain(vectorstore)
+        
+        # Update session state
+        print("💾 Updating session state...")
+        st.session_state.vectorstore = vectorstore
+        st.session_state.qa_chain = qa_chain
+        st.session_state.start_chatting = True
+        
+        print("✅ QA chain initialization completed successfully")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error initializing QA chain: {str(e)}")
+        st.error(f"Error initializing QA chain: {str(e)}")
         return False
 
 def extract_text_with_links(pdf_path):
@@ -498,6 +564,22 @@ def process_all_user_documents(credentials, user_email):
         
         if not all_files:
             st.warning("No PDF or Google Doc files found in your Google Drive.")
+            
+            # Check if there are existing documents in OpenSearch
+            existing_doc_count = get_document_count()
+            if existing_doc_count > 0:
+                st.info(f"📚 Found {existing_doc_count} existing documents in your knowledge base.")
+                st.success("✅ You can start asking questions about your existing documents!")
+                
+                # Initialize QA chain from existing documents
+                if initialize_qa_chain_from_existing():
+                    st.session_state.processed_pdfs = True
+                    st.session_state.processing_status = "✅ Ready to chat with existing documents!"
+                else:
+                    st.error("❌ Failed to initialize chat interface with existing documents.")
+            else:
+                st.session_state.processing_status = "📚 No documents found. Please add documents to your Google Drive."
+            
             return
 
         # Build Drive service
@@ -507,6 +589,9 @@ def process_all_user_documents(credentials, user_email):
         documents = []
         processed_count = 0
         failed_count = 0
+        skipped_count = 0
+        
+        print(f"🔍 Processing {len(pdf_files)} PDF files and {len(doc_files)} Google Doc files")
         
         # Process PDFs
         for pdf_file in pdf_files:
@@ -516,7 +601,8 @@ def process_all_user_documents(credentials, user_email):
             # Check if already processed
             file_hash = hashlib.md5(f"{file_id}_{pdf_file.get('modifiedTime', '')}".encode()).hexdigest()
             if file_hash in processed_files:
-                print(f"Skipping already processed PDF: {file_name}")
+                print(f"⏭️ Skipping already processed PDF: {file_name}")
+                skipped_count += 1
                 continue
             
             try:
@@ -558,7 +644,8 @@ def process_all_user_documents(credentials, user_email):
             # Check if already processed
             file_hash = hashlib.md5(f"{file_id}_{doc_file.get('modifiedTime', '')}".encode()).hexdigest()
             if file_hash in processed_files:
-                print(f"Skipping already processed Google Doc: {file_name}")
+                print(f"⏭️ Skipping already processed Google Doc: {file_name}")
+                skipped_count += 1
                 continue
             
             try:
@@ -586,7 +673,55 @@ def process_all_user_documents(credentials, user_email):
                 failed_count += 1
         
         if not documents:
+            print(f"📊 Summary: {processed_count} processed, {failed_count} failed, {skipped_count} skipped")
             st.warning("No new documents to process.")
+            
+            # Check for metadata mismatch
+            has_mismatch, metadata_count, opensearch_count = check_metadata_mismatch(user_email)
+            
+            if has_mismatch:
+                st.error(f"⚠️ Data inconsistency detected!")
+                st.info(f"• Metadata shows {metadata_count} processed files")
+                st.info(f"• OpenSearch shows {opensearch_count} documents")
+                st.warning("This usually happens when OpenSearch was cleared but metadata wasn't updated.")
+                
+                col1, col2, col3 = st.columns([1, 1, 1])
+                with col2:
+                    if st.button("🔄 Fix & Reprocess All Documents", type="primary", use_container_width=True):
+                        print("🔧 Fix button clicked!")
+                        with st.spinner("Fixing data inconsistency..."):
+                            print("🔄 Starting fix process...")
+                            if clear_metadata_and_reprocess(user_email):
+                                print("✅ Fix completed successfully")
+                                st.success("✅ Data inconsistency fixed! Click 'Process Documents' again to reprocess all files.")
+                                st.rerun()
+                            else:
+                                print("❌ Fix failed")
+                                st.error("❌ Failed to fix data inconsistency.")
+                
+                return
+            
+            # Check if there are existing documents in OpenSearch
+            existing_doc_count = get_document_count()
+            print(f"🔍 Found {existing_doc_count} existing documents in OpenSearch")
+            
+            if existing_doc_count > 0:
+                print("✅ Initializing QA chain from existing documents")
+                st.info(f"📚 Found {existing_doc_count} existing documents in your knowledge base.")
+                st.success("✅ You can start asking questions about your existing documents!")
+                
+                # Initialize QA chain from existing documents
+                if initialize_qa_chain_from_existing():
+                    print("✅ Successfully initialized QA chain")
+                    st.session_state.processed_pdfs = True
+                    st.session_state.processing_status = "✅ Ready to chat with existing documents!"
+                else:
+                    print("❌ Failed to initialize QA chain")
+                    st.error("❌ Failed to initialize chat interface with existing documents.")
+            else:
+                print("❌ No existing documents found in OpenSearch")
+                st.session_state.processing_status = "📚 No documents found. Please add documents to your Google Drive."
+            
             return
 
         st.success(f"✅ Successfully processed {processed_count} files ({failed_count} failed)")
@@ -863,6 +998,83 @@ Context: {context}"""),
 
     return create_retrieval_chain(history_aware_retriever, document_chain)
 
+def get_document_count():
+    """Get the number of documents in OpenSearch."""
+    try:
+        print("🔍 Checking document count in OpenSearch...")
+        client = create_opensearch_client()
+        if not client:
+            print("❌ Failed to create OpenSearch client")
+            return 0
+        
+        # Check if index exists
+        if not client.indices.exists(index=OPENSEARCH_INDEX):
+            print(f"❌ Index {OPENSEARCH_INDEX} does not exist")
+            return 0
+        
+        # Count documents in the index
+        count_response = client.count(index=OPENSEARCH_INDEX)
+        document_count = count_response.get('count', 0)
+        print(f"📊 Found {document_count} documents in OpenSearch")
+        
+        return document_count
+        
+    except Exception as e:
+        print(f"❌ Error getting document count: {str(e)}")
+        return 0
+
+def check_metadata_mismatch(user_email):
+    """Check if there's a mismatch between processed metadata and OpenSearch documents."""
+    try:
+        # Load processed files metadata
+        processed_files = load_processed_files_metadata(user_email)
+        metadata_count = len(processed_files)
+        
+        # Get OpenSearch document count
+        opensearch_count = get_document_count()
+        
+        print(f"📊 Metadata shows {metadata_count} processed files")
+        print(f"📊 OpenSearch shows {opensearch_count} documents")
+        
+        if metadata_count > 0 and opensearch_count == 0:
+            print("⚠️ Mismatch detected: Metadata exists but no documents in OpenSearch")
+            return True, metadata_count, opensearch_count
+        else:
+            print("✅ Metadata and OpenSearch are in sync")
+            return False, metadata_count, opensearch_count
+            
+    except Exception as e:
+        print(f"❌ Error checking metadata mismatch: {str(e)}")
+        return False, 0, 0
+
+def clear_metadata_and_reprocess(user_email):
+    """Clear metadata and allow reprocessing of all documents."""
+    try:
+        print("🗑️ Clearing processed files metadata...")
+        metadata_path = get_user_metadata_path(user_email)
+        print(f"📁 Metadata path: {metadata_path}")
+        
+        if os.path.exists(metadata_path):
+            os.remove(metadata_path)
+            print("✅ Metadata file deleted")
+        else:
+            print("⚠️ Metadata file not found")
+        
+        # Reset session state
+        print("🔄 Resetting session state...")
+        st.session_state.processed_pdfs = False
+        st.session_state.vectorstore = None
+        st.session_state.qa_chain = None
+        st.session_state.start_chatting = False
+        
+        print("✅ Session state reset")
+        print("✅ Clear metadata and reprocess completed successfully")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error clearing metadata: {str(e)}")
+        return False
+
 def main():
     st.set_page_config(
         page_title="AI Document Assistant",
@@ -958,11 +1170,12 @@ def main():
                 client = create_opensearch_client()
                 if client and client.indices.exists(index=OPENSEARCH_INDEX):
                     client.indices.delete(index=OPENSEARCH_INDEX)
+                    st.session_state.processed_pdfs = False
+                    st.session_state.vectorstore = None
+                    st.session_state.qa_chain = None
+                    st.session_state.start_chatting = False
                     st.success("✅ All data cleared!")
                 
-                st.session_state.processed_pdfs = False
-                st.session_state.vectorstore = None
-                st.session_state.qa_chain = None
                 st.rerun()
         
         # Process documents button
@@ -976,6 +1189,21 @@ def main():
         # Show processing status
         if st.session_state.processing_status:
             st.info(st.session_state.processing_status)
+        
+        # Show document count
+        doc_count = get_document_count()
+        if doc_count > 0:
+            st.success(f"📊 {doc_count} documents in knowledge base")
+        elif st.session_state.processed_pdfs:
+            st.info("📊 No documents found in knowledge base")
+        
+        # Debug information (can be removed later)
+        with st.expander("🔧 Debug Info"):
+            st.write(f"processed_pdfs: {st.session_state.processed_pdfs}")
+            st.write(f"start_chatting: {st.session_state.start_chatting}")
+            st.write(f"has_qa_chain: {st.session_state.qa_chain is not None}")
+            st.write(f"has_vectorstore: {st.session_state.vectorstore is not None}")
+            st.write(f"document_count: {doc_count}")
         
         st.markdown("---")
         st.header("ℹ️ About")
@@ -991,55 +1219,76 @@ def main():
         """)
     
     # Main content area
-    if not st.session_state.processed_pdfs:
-        st.info("📚 No documents processed yet. Click 'Process Documents' in the sidebar to get started.")
+    if not st.session_state.processed_pdfs and not st.session_state.start_chatting:
+        # Check if there are existing documents in OpenSearch
+        has_existing_docs = check_existing_documents()
+        
+        if has_existing_docs:
+            st.info("📚 Found existing documents in your knowledge base!")
+            st.markdown("You can start asking questions about your previously processed documents.")
+            
+            col1, col2, col3 = st.columns([1, 1, 1])
+            with col2:
+                if st.button("🚀 Start Asking Questions", type="primary", use_container_width=True):
+                    with st.spinner("Initializing chat interface..."):
+                        if initialize_qa_chain_from_existing():
+                            st.success("✅ Chat interface ready! You can now ask questions about your documents.")
+                            st.rerun()
+                        else:
+                            st.error("❌ Failed to initialize chat interface.")
+            
+            st.markdown("---")
+            st.markdown("**Or** click 'Process Documents' in the sidebar to scan for new documents in your Google Drive.")
+        else:
+            st.info("📚 No documents processed yet. Click 'Process Documents' in the sidebar to get started.")
         return
     
     # Chat interface
-    st.header("💬 Ask Questions About Your Documents")
-    
-    # Initialize chat history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    
-    # Display chat messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-    
-    # Chat input
-    if prompt := st.chat_input("Ask a question about your documents..."):
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    if st.session_state.processed_pdfs or st.session_state.start_chatting:
+        st.header("💬 Ask Questions About Your Documents")
         
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        # Initialize chat history
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
         
-        # Generate response
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
+        # Display chat messages
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+        
+        # Chat input
+        if prompt := st.chat_input("Ask a question about your documents..."):
+            # Add user message to chat history
+            st.session_state.messages.append({"role": "user", "content": prompt})
             
-            try:
-                if st.session_state.qa_chain:
-                    # Get response from QA chain
-                    response = st.session_state.qa_chain.invoke({"input": prompt})
-                    answer = response.get("answer", "Sorry, I couldn't find an answer.")
-                    
-                    # Display response
-                    message_placeholder.markdown(answer)
-                    
-                    # Add assistant response to chat history
-                    st.session_state.messages.append({"role": "assistant", "content": answer})
-                else:
-                    message_placeholder.error("❌ QA chain not initialized. Please process documents first.")
-            except Exception as e:
-                message_placeholder.error(f"❌ Error generating response: {str(e)}")
-    
-    # Clear chat button
-    if st.button("🗑️ Clear Chat History"):
-        st.session_state.messages = []
-        st.rerun()
+            # Display user message
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # Generate response
+            with st.chat_message("assistant"):
+                message_placeholder = st.empty()
+                
+                try:
+                    if st.session_state.qa_chain:
+                        # Get response from QA chain
+                        response = st.session_state.qa_chain.invoke({"input": prompt})
+                        answer = response.get("answer", "Sorry, I couldn't find an answer.")
+                        
+                        # Display response
+                        message_placeholder.markdown(answer)
+                        
+                        # Add assistant response to chat history
+                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                    else:
+                        message_placeholder.error("❌ QA chain not initialized. Please process documents first.")
+                except Exception as e:
+                    message_placeholder.error(f"❌ Error generating response: {str(e)}")
+        
+        # Clear chat button
+        if st.button("🗑️ Clear Chat History"):
+            st.session_state.messages = []
+            st.rerun()
 
 if __name__ == "__main__":
     main() 
