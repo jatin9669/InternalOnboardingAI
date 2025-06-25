@@ -29,6 +29,16 @@ from PIL import Image
 import io
 from image_processor import init_gemini, process_pdf_images
 
+# LlamaIndex imports for sheets processing
+from llama_index.llms.google_genai import GoogleGenAI
+from llama_index.core import Settings, VectorStoreIndex, StorageContext, PromptTemplate
+from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
+from llama_index.vector_stores.opensearch import OpensearchVectorStore, OpensearchVectorClient
+from llama_index.core.memory import ChatMemoryBuffer
+from llama_index.core.chat_engine import CondenseQuestionChatEngine
+from llama_parse import LlamaParse
+import traceback
+
 # Load environment variables
 load_dotenv()
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY')
@@ -61,10 +71,14 @@ if 'credentials' not in st.session_state:
     st.session_state.credentials = None
 if 'processed_pdfs' not in st.session_state:
     st.session_state.processed_pdfs = False
+if 'processed_sheets' not in st.session_state:
+    st.session_state.processed_sheets = False
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 if 'qa_chain' not in st.session_state:
     st.session_state.qa_chain = None
+if 'sheets_query_engine' not in st.session_state:
+    st.session_state.sheets_query_engine = None
 if 'vectorstore' not in st.session_state:
     st.session_state.vectorstore = None
 if 'processing_status' not in st.session_state:
@@ -213,34 +227,48 @@ def initialize_qa_chain_from_existing():
 
 def extract_text_with_links(pdf_path):
     """Extract text and hyperlinks from a PDF."""
-    doc = fitz.open(pdf_path)
-    extracted_data = []
+    try:
+        doc = fitz.open(pdf_path)
+        extracted_data = []
+        
+        print(f"📖 PDF has {len(doc)} pages")
 
-    for page_num, page in enumerate(doc):
-        page_text = page.get_text("text")
-        links = []
+        for page_num, page in enumerate(doc):
+            page_text = page.get_text("text")
+            links = []
 
-        # Extract clickable links
-        for link in page.get_links():
-            if "uri" in link:
-                links.append(link["uri"])
-                page_text += f"\n[🔗 Link: {link['uri']}]"
+            # Extract clickable links
+            for link in page.get_links():
+                if "uri" in link:
+                    links.append(link["uri"])
+                    page_text += f"\n[🔗 Link: {link['uri']}]"
 
-        # Extract plain text URLs using regex
-        url_pattern = r"https?://\S+"  
-        text_links = re.findall(url_pattern, page_text)
-        links.extend(text_links)
+            # Extract plain text URLs using regex
+            url_pattern = r"https?://\S+"  
+            text_links = re.findall(url_pattern, page_text)
+            links.extend(text_links)
 
-        # Remove duplicates
-        links = list(set(links))
+            # Remove duplicates
+            links = list(set(links))
+            
+            # Debug: Show text length for each page
+            text_length = len(page_text.strip())
+            print(f"📄 Page {page_num + 1}: {text_length} characters, {len(links)} links")
 
-        extracted_data.append({
-            "page": page_num + 1,
-            "text": page_text,
-            "links": links
-        })
-
-    return extracted_data
+            extracted_data.append({
+                "page": page_num + 1,
+                "text": page_text,
+                "links": links
+            })
+        
+        doc.close()
+        return extracted_data
+        
+    except Exception as e:
+        print(f"❌ Error extracting text from PDF: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 def get_google_oauth_url():
     """Generate Google OAuth URL for authentication."""
@@ -406,6 +434,55 @@ def scan_entire_drive_for_docs(credentials):
         st.error(f"Error scanning Drive for Google Docs: {str(e)}")
         return []
 
+def scan_entire_drive_for_sheets(credentials):
+    """Scan entire Google Drive for Excel and Google Sheets files."""
+    try:
+        service = build('drive', 'v3', credentials=credentials)
+        
+        # Query to find Excel files and Google Sheets
+        excel_query = "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' and trashed=false"
+        google_sheets_query = "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
+        
+        results = []
+        
+        # Get Excel files
+        page_token = None
+        while True:
+            response = service.files().list(
+                q=excel_query,
+                spaces='drive',
+                fields='nextPageToken, files(id, name, modifiedTime, size)',
+                pageToken=page_token
+            ).execute()
+            
+            results.extend(response.get('files', []))
+            page_token = response.get('nextPageToken', None)
+            
+            if page_token is None:
+                break
+        
+        # Get Google Sheets
+        page_token = None
+        while True:
+            response = service.files().list(
+                q=google_sheets_query,
+                spaces='drive',
+                fields='nextPageToken, files(id, name, modifiedTime, size)',
+                pageToken=page_token
+            ).execute()
+            
+            results.extend(response.get('files', []))
+            page_token = response.get('nextPageToken', None)
+            
+            if page_token is None:
+                break
+        
+        return results
+        
+    except Exception as e:
+        st.error(f"Error scanning Drive for sheets: {str(e)}")
+        return []
+
 def download_pdf_from_drive(service, file_id, file_name, download_dir):
     """Download a single PDF file from Google Drive."""
     try:
@@ -464,6 +541,34 @@ def download_google_doc_content(service, file_id, file_name):
         st.error(f"Error downloading Google Doc {file_name}: {str(e)}")
         return None
 
+def download_sheet_from_drive(service, file_id, file_name, download_dir):
+    """Download a sheet file from Google Drive."""
+    try:
+        # For Excel files, download directly
+        if file_name.endswith(('.xlsx', '.xls')):
+            request = service.files().get_media(fileId=file_id)
+        else:
+            # For Google Sheets, export as Excel
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+        
+        file_path = os.path.join(download_dir, f"{file_id}_{file_name}")
+        if not file_path.endswith('.xlsx'):
+            file_path += '.xlsx'
+        
+        with open(file_path, 'wb') as f:
+            downloader = MediaIoBaseDownload(f, request)
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+        
+        return file_path
+    except Exception as e:
+        print(f"Failed to download {file_name}: {str(e)}")
+        return None
+
 def process_pdf_with_images(pdf_path, file_name, file_id):
     """Process a PDF file to extract both text and images."""
     try:
@@ -473,25 +578,37 @@ def process_pdf_with_images(pdf_path, file_name, file_id):
         documents = []
         
         # Extract text with links
+        print(f"🔍 Extracting text from PDF: {file_name}")
         extracted_pages = extract_text_with_links(pdf_path)
+        print(f"📄 Extracted {len(extracted_pages)} pages from {file_name}")
         
         # Process text documents
         from langchain_core.documents import Document
+        text_doc_count = 0
         for page in extracted_pages:
-            combined_text = page["text"] + "\n\n🔗 Links:\n" + "\n".join(page["links"])
-            metadata = {
-                "source": file_name,
-                "page": page["page"],
-                "file_id": file_id,
-                "type": "text"
-            }
-            documents.append(Document(page_content=combined_text, metadata=metadata))
+            page_text = page["text"].strip()
+            if page_text:  # Only create document if there's actual text
+                combined_text = page_text + "\n\n🔗 Links:\n" + "\n".join(page["links"])
+                metadata = {
+                    "source": file_name,
+                    "page": page["page"],
+                    "file_id": file_id,
+                    "type": "text"
+                }
+                documents.append(Document(page_content=combined_text, metadata=metadata))
+                text_doc_count += 1
+                print(f"✅ Created text document for page {page['page']} ({len(page_text)} characters)")
+            else:
+                print(f"⚠️ No text found on page {page['page']}")
+        
+        print(f"📝 Created {text_doc_count} text documents from {file_name}")
         
         # Process images using Gemini Vision
-        print(f"Starting image processing for {file_name}")
+        print(f"🖼️ Starting image processing for {file_name}")
         image_results = process_pdf_images(pdf_path, model)
-        print(f"Image processing completed for {file_name}: {len(image_results)} results")
+        print(f"🖼️ Image processing completed for {file_name}: {len(image_results)} results")
         
+        image_doc_count = 0
         for img_result in image_results:
             metadata = {
                 "source": file_name,
@@ -501,12 +618,17 @@ def process_pdf_with_images(pdf_path, file_name, file_id):
                 "type": "image"
             }
             documents.append(Document(page_content=img_result["description"], metadata=metadata))
-            print(f"Added image document: {img_result['image_id']}")
+            image_doc_count += 1
+            print(f"✅ Added image document: {img_result['image_id']}")
+        
+        print(f"📊 Total documents created for {file_name}: {len(documents)} ({text_doc_count} text, {image_doc_count} images)")
         
         return documents
         
     except Exception as e:
-        print(f"Error processing PDF {file_name}: {str(e)}")
+        print(f"❌ Error processing PDF {file_name}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def get_user_vectorstore_path(user_email):
@@ -539,7 +661,7 @@ def load_processed_files_metadata(user_email):
     return {}
 
 def process_all_user_documents(credentials, user_email):
-    """Process all PDF and Google Doc files for a user."""
+    """Process all PDF, Google Doc, and Sheet files for a user."""
     try:
         # Create OpenSearch client
         client = create_opensearch_client()
@@ -553,17 +675,18 @@ def process_all_user_documents(credentials, user_email):
         # Load previously processed files metadata
         processed_files = load_processed_files_metadata(user_email)
         
-        # Scan for PDFs and Google Docs
-        st.session_state.processing_status = "📁 Scanning your Google Drive for PDF and Google Doc files..."
+        # Scan for PDFs, Google Docs, and Sheets
+        st.session_state.processing_status = "📁 Scanning your Google Drive for PDF, Google Doc, and Sheet files..."
         
         pdf_files = scan_entire_drive_for_pdfs(credentials)
         doc_files = scan_entire_drive_for_docs(credentials)
+        sheet_files = scan_entire_drive_for_sheets(credentials)
         
-        all_files = pdf_files + doc_files
-        st.session_state.processing_status = f"📊 Found {len(pdf_files)} PDF files and {len(doc_files)} Google Doc files in your Drive"
+        all_files = pdf_files + doc_files + sheet_files
+        st.session_state.processing_status = f"📊 Found {len(pdf_files)} PDF files, {len(doc_files)} Google Doc files, and {len(sheet_files)} Sheet files in your Drive"
         
         if not all_files:
-            st.warning("No PDF or Google Doc files found in your Google Drive.")
+            st.warning("No PDF, Google Doc, or Sheet files found in your Google Drive.")
             
             # Check if there are existing documents in OpenSearch
             existing_doc_count = get_document_count()
@@ -587,11 +710,12 @@ def process_all_user_documents(credentials, user_email):
         
         # Process files
         documents = []
+        all_sheet_documents = []  # Store documents instead of file paths
         processed_count = 0
         failed_count = 0
         skipped_count = 0
         
-        print(f"🔍 Processing {len(pdf_files)} PDF files and {len(doc_files)} Google Doc files")
+        print(f"🔍 Processing {len(pdf_files)} PDF files, {len(doc_files)} Google Doc files, and {len(sheet_files)} Sheet files")
         
         # Process PDFs
         for pdf_file in pdf_files:
@@ -672,267 +796,304 @@ def process_all_user_documents(credentials, user_email):
                 print(f"Error processing Google Doc {file_name}: {str(e)}")
                 failed_count += 1
         
-        if not documents:
-            print(f"📊 Summary: {processed_count} processed, {failed_count} failed, {skipped_count} skipped")
-            st.warning("No new documents to process.")
+        # Process Sheets
+        for sheet_file in sheet_files:
+            file_id = sheet_file['id']
+            file_name = sheet_file['name']
             
-            # Check for metadata mismatch
-            has_mismatch, metadata_count, opensearch_count = check_metadata_mismatch(user_email)
+            # Check if already processed
+            file_hash = hashlib.md5(f"{file_id}_{sheet_file.get('modifiedTime', '')}".encode()).hexdigest()
+            if file_hash in processed_files:
+                print(f"⏭️ Skipping already processed Sheet: {file_name}")
+                skipped_count += 1
+                continue
             
-            if has_mismatch:
-                st.error(f"⚠️ Data inconsistency detected!")
-                st.info(f"• Metadata shows {metadata_count} processed files")
-                st.info(f"• OpenSearch shows {opensearch_count} documents")
-                st.warning("This usually happens when OpenSearch was cleared but metadata wasn't updated.")
+            try:
+                st.session_state.processing_status = f"📊 Processing Sheet: {file_name}"
                 
-                col1, col2, col3 = st.columns([1, 1, 1])
-                with col2:
-                    if st.button("🔄 Fix & Reprocess All Documents", type="primary", use_container_width=True):
-                        print("🔧 Fix button clicked!")
-                        with st.spinner("Fixing data inconsistency..."):
-                            print("🔄 Starting fix process...")
-                            if clear_metadata_and_reprocess(user_email):
-                                print("✅ Fix completed successfully")
-                                st.success("✅ Data inconsistency fixed! Click 'Process Documents' again to reprocess all files.")
-                                st.rerun()
+                # Download and process sheet file immediately
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    sheet_path = download_sheet_from_drive(service, file_id, file_name, temp_dir)
+                    if sheet_path:
+                        # Process with LlamaParse immediately while file exists
+                        try:
+                            parser = initialize_llamaindex_parser()
+                            if parser:
+                                sheet_documents = parser.load_data(sheet_path)
+                                if sheet_documents:
+                                    all_sheet_documents.extend(sheet_documents)
+                                    processed_count += 1
+                                    print(f"✅ Successfully processed {file_name}: {len(sheet_documents)} documents")
+                                    
+                                    # Save metadata
+                                    processed_files[file_hash] = {
+                                        'file_id': file_id,
+                                        'file_name': file_name,
+                                        'file_type': 'sheet',
+                                        'processed_time': datetime.now().isoformat(),
+                                        'document_count': len(sheet_documents)
+                                    }
+                                else:
+                                    print(f"⚠️ No documents extracted from {file_name}")
+                                    failed_count += 1
                             else:
-                                print("❌ Fix failed")
-                                st.error("❌ Failed to fix data inconsistency.")
-                
-                return
-            
-            # Check if there are existing documents in OpenSearch
-            existing_doc_count = get_document_count()
-            print(f"🔍 Found {existing_doc_count} existing documents in OpenSearch")
-            
-            if existing_doc_count > 0:
-                print("✅ Initializing QA chain from existing documents")
-                st.info(f"📚 Found {existing_doc_count} existing documents in your knowledge base.")
-                st.success("✅ You can start asking questions about your existing documents!")
-                
-                # Initialize QA chain from existing documents
-                if initialize_qa_chain_from_existing():
-                    print("✅ Successfully initialized QA chain")
-                    st.session_state.processed_pdfs = True
-                    st.session_state.processing_status = "✅ Ready to chat with existing documents!"
-                else:
-                    print("❌ Failed to initialize QA chain")
-                    st.error("❌ Failed to initialize chat interface with existing documents.")
-            else:
-                print("❌ No existing documents found in OpenSearch")
-                st.session_state.processing_status = "📚 No documents found. Please add documents to your Google Drive."
-            
-            return
-
-        st.success(f"✅ Successfully processed {processed_count} files ({failed_count} failed)")
-        st.info("🧠 Creating embeddings...")
-        
-        # Create embeddings using Gemini (needed for semantic chunking)
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=GOOGLE_API_KEY
-        )
-        
-        # Separate text and image documents
-        text_docs = [doc for doc in documents if doc.metadata.get('type') == 'text']
-        image_docs = [doc for doc in documents if doc.metadata.get('type') == 'image']
-        
-        print(f"Processing {len(text_docs)} text documents and {len(image_docs)} image documents")
-        
-        # Advanced semantic chunking function using embeddings and similarity
-        def semantic_chunk_text(text, embeddings, chunk_size=1500, overlap=300, 
-                               initial_threshold=0.6, appending_threshold=0.8):
-            """Split text semantically using embeddings to find natural breakpoints"""
-            if len(text) <= chunk_size:
-                return [text]
-            
-            # Split into sentences first using multiple approaches
-            import re
-            sentences = []
-            
-            # Try multiple sentence splitting approaches
-            # 1. Split by periods followed by space and capital letter
-            period_splits = re.split(r'(?<=\.)\s+(?=[A-Z])', text)
-            
-            # 2. Split by other sentence endings
-            sentence_endings = re.split(r'(?<=[.!?])\s+', text)
-            
-            # Use the approach that gives more reasonable sentence lengths
-            if len(period_splits) > len(sentence_endings) and all(len(s) > 10 for s in period_splits):
-                sentences = period_splits
-            else:
-                sentences = sentence_endings
-            
-            # Clean up sentences
-            sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 10]
-            
-            if len(sentences) <= 1:
-                # Fallback to recursive splitting if no sentence breaks
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=chunk_size,
-                    chunk_overlap=overlap,
-                    separators=["\n\n\n", "\n\n", "\n", ". ", "! ", "? ", "; ", ": ", " ", ""],
-                    keep_separator=True
-                )
-                return text_splitter.split_text(text)
-            
-            # Generate embeddings for all sentences
-            print(f"Generating embeddings for {len(sentences)} sentences...")
-            sentence_embeddings = embeddings.embed_documents(sentences)
-            
-            # Calculate cosine similarity between consecutive sentences
-            import numpy as np
-            from sklearn.metrics.pairwise import cosine_similarity
-            
-            chunks = []
-            current_chunk = []
-            current_length = 0
-            
-            for i, (sentence, embedding) in enumerate(zip(sentences, sentence_embeddings)):
-                sentence_length = len(sentence)
-                
-                # Check if adding this sentence would exceed chunk size
-                if current_length + sentence_length > chunk_size and current_chunk:
-                    # Finalize current chunk
-                    chunks.append(' '.join(current_chunk))
-                    
-                    # Start new chunk with overlap (last few sentences)
-                    overlap_sentences = current_chunk[-2:] if len(current_chunk) >= 2 else current_chunk
-                    current_chunk = overlap_sentences.copy()
-                    current_length = sum(len(s) for s in current_chunk)
-                
-                # If this is the first sentence or we have a current chunk, check similarity
-                if current_chunk:
-                    # Calculate similarity with the last sentence in current chunk
-                    last_sentence_idx = i - 1
-                    if last_sentence_idx >= 0:
-                        last_embedding = sentence_embeddings[last_sentence_idx]
-                        similarity = cosine_similarity([last_embedding], [embedding])[0][0]
-                        
-                        # If similarity is low, start a new chunk (semantic breakpoint)
-                        if similarity < initial_threshold and current_length > chunk_size * 0.3:
-                            chunks.append(' '.join(current_chunk))
-                            current_chunk = [sentence]
-                            current_length = sentence_length
-                            continue
-                
-                # Add sentence to current chunk
-                current_chunk.append(sentence)
-                current_length += sentence_length
-            
-            # Add the final chunk
-            if current_chunk:
-                chunks.append(' '.join(current_chunk))
-            
-            # Post-process: merge very similar adjacent chunks
-            if len(chunks) > 1:
-                final_chunks = []
-                i = 0
-                while i < len(chunks):
-                    if i < len(chunks) - 1:
-                        # Check if we can merge with next chunk
-                        chunk1_embedding = embeddings.embed_documents([chunks[i]])[0]
-                        chunk2_embedding = embeddings.embed_documents([chunks[i + 1]])[0]
-                        similarity = cosine_similarity([chunk1_embedding], [chunk2_embedding])[0][0]
-                        
-                        if similarity > appending_threshold and len(chunks[i]) + len(chunks[i + 1]) <= chunk_size * 1.2:
-                            # Merge chunks
-                            merged_chunk = chunks[i] + " " + chunks[i + 1]
-                            final_chunks.append(merged_chunk)
-                            i += 2  # Skip next chunk
-                        else:
-                            final_chunks.append(chunks[i])
-                            i += 1
+                                print(f"❌ Failed to initialize parser for {file_name}")
+                                failed_count += 1
+                        except Exception as e:
+                            print(f"❌ Error processing {file_name} with LlamaParse: {str(e)}")
+                            failed_count += 1
                     else:
-                        final_chunks.append(chunks[i])
-                        i += 1
-                
-                chunks = final_chunks
-            
-            return chunks
+                        print(f"❌ Failed to download {file_name}")
+                        failed_count += 1
+                        
+            except Exception as e:
+                print(f"Error processing Sheet {file_name}: {str(e)}")
+                failed_count += 1
         
-        # Apply semantic chunking to text documents
-        text_splits = []
-        for doc in text_docs:
-            print(f"Semantically chunking document: {doc.metadata.get('source', 'unknown')}")
-            chunks = semantic_chunk_text(doc.page_content, embeddings)
-            for i, chunk in enumerate(chunks):
-                from langchain_core.documents import Document
-                chunk_doc = Document(
-                    page_content=chunk,
-                    metadata=doc.metadata.copy()
-                )
-                chunk_doc.metadata['chunk_id'] = i
-                chunk_doc.metadata['total_chunks'] = len(chunks)
-                chunk_doc.metadata['chunking_method'] = 'semantic'
-                text_splits.append(chunk_doc)
-        
-        # For image descriptions, group by source and page for better organization
-        image_splits = []
-        if image_docs:
-            # Group images by source and page
-            image_groups = {}
-            for img_doc in image_docs:
-                source = img_doc.metadata.get('source', 'unknown')
-                page = img_doc.metadata.get('page', 0)
-                key = f"{source}_page_{page}"
-                
-                if key not in image_groups:
-                    image_groups[key] = []
-                image_groups[key].append(img_doc)
+        # Process documents with LangChain (PDFs and Google Docs)
+        if documents:
+            st.success(f"✅ Successfully processed {processed_count} files ({failed_count} failed)")
+            st.info("🧠 Creating embeddings for documents...")
             
-            # Process each group semantically
-            for key, group_docs in image_groups.items():
-                if len(group_docs) == 1:
-                    # Single image, keep as-is
-                    image_splits.extend(group_docs)
-                else:
-                    # Multiple images on same page, combine and apply semantic chunking
-                    combined_content = "\n\n".join([doc.page_content for doc in group_docs])
-                    chunks = semantic_chunk_text(combined_content, embeddings, chunk_size=1000, overlap=200)
+            # Create embeddings using Gemini (needed for semantic chunking)
+            embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/embedding-001",
+                google_api_key=GOOGLE_API_KEY
+            )
+            
+            # Separate text and image documents
+            text_docs = [doc for doc in documents if doc.metadata.get('type') == 'text']
+            image_docs = [doc for doc in documents if doc.metadata.get('type') == 'image']
+            
+            print(f"Processing {len(text_docs)} text documents and {len(image_docs)} image documents")
+            
+            # Check if we have any documents to process
+            if not text_docs and not image_docs:
+                print("⚠️ No text or image documents to process")
+                st.warning("No text or image content found in the processed files.")
+            else:
+                # Advanced semantic chunking function using embeddings and similarity
+                def semantic_chunk_text(text, embeddings, chunk_size=1500, overlap=300, 
+                                       initial_threshold=0.6, appending_threshold=0.8):
+                    """Split text semantically using embeddings to find natural breakpoints"""
+                    if len(text) <= chunk_size:
+                        return [text]
                     
+                    # Split into sentences first using multiple approaches
+                    import re
+                    sentences = []
+                    
+                    # Try multiple sentence splitting approaches
+                    # 1. Split by periods followed by space and capital letter
+                    period_splits = re.split(r'(?<=\.)\s+(?=[A-Z])', text)
+                    
+                    # 2. Split by other sentence endings
+                    sentence_endings = re.split(r'(?<=[.!?])\s+', text)
+                    
+                    # Use the approach that gives more reasonable sentence lengths
+                    if len(period_splits) > len(sentence_endings) and all(len(s) > 10 for s in period_splits):
+                        sentences = period_splits
+                    else:
+                        sentences = sentence_endings
+                    
+                    # Clean up sentences
+                    sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 10]
+                    
+                    if len(sentences) <= 1:
+                        # Fallback to recursive splitting if no sentence breaks
+                        text_splitter = RecursiveCharacterTextSplitter(
+                            chunk_size=chunk_size,
+                            chunk_overlap=overlap,
+                            separators=["\n\n\n", "\n\n", "\n", ". ", "! ", "? ", "; ", ": ", " ", ""],
+                            keep_separator=True
+                        )
+                        return text_splitter.split_text(text)
+                    
+                    # Generate embeddings for all sentences
+                    print(f"Generating embeddings for {len(sentences)} sentences...")
+                    sentence_embeddings = embeddings.embed_documents(sentences)
+                    
+                    # Calculate cosine similarity between consecutive sentences
+                    import numpy as np
+                    from sklearn.metrics.pairwise import cosine_similarity
+                    
+                    chunks = []
+                    current_chunk = []
+                    current_length = 0
+                    
+                    for i, (sentence, embedding) in enumerate(zip(sentences, sentence_embeddings)):
+                        sentence_length = len(sentence)
+                        
+                        # Check if adding this sentence would exceed chunk size
+                        if current_length + sentence_length > chunk_size and current_chunk:
+                            # Finalize current chunk
+                            chunks.append(' '.join(current_chunk))
+                            
+                            # Start new chunk with overlap (last few sentences)
+                            overlap_sentences = current_chunk[-2:] if len(current_chunk) >= 2 else current_chunk
+                            current_chunk = overlap_sentences.copy()
+                            current_length = sum(len(s) for s in current_chunk)
+                        
+                        # If this is the first sentence or we have a current chunk, check similarity
+                        if current_chunk:
+                            # Calculate similarity with the last sentence in current chunk
+                            last_sentence_idx = i - 1
+                            if last_sentence_idx >= 0:
+                                last_embedding = sentence_embeddings[last_sentence_idx]
+                                similarity = cosine_similarity([last_embedding], [embedding])[0][0]
+                                
+                                # If similarity is low, start a new chunk (semantic breakpoint)
+                                if similarity < initial_threshold and current_length > chunk_size * 0.3:
+                                    chunks.append(' '.join(current_chunk))
+                                    current_chunk = [sentence]
+                                    current_length = sentence_length
+                                    continue
+                        
+                        # Add sentence to current chunk
+                        current_chunk.append(sentence)
+                        current_length += sentence_length
+                    
+                    # Add the final chunk
+                    if current_chunk:
+                        chunks.append(' '.join(current_chunk))
+                    
+                    # Post-process: merge very similar adjacent chunks
+                    if len(chunks) > 1:
+                        final_chunks = []
+                        i = 0
+                        while i < len(chunks):
+                            if i < len(chunks) - 1:
+                                # Check if we can merge with next chunk
+                                chunk1_embedding = embeddings.embed_documents([chunks[i]])[0]
+                                chunk2_embedding = embeddings.embed_documents([chunks[i + 1]])[0]
+                                similarity = cosine_similarity([chunk1_embedding], [chunk2_embedding])[0][0]
+                                
+                                if similarity > appending_threshold and len(chunks[i]) + len(chunks[i + 1]) <= chunk_size * 1.2:
+                                    # Merge chunks
+                                    merged_chunk = chunks[i] + " " + chunks[i + 1]
+                                    final_chunks.append(merged_chunk)
+                                    i += 2  # Skip next chunk
+                                else:
+                                    final_chunks.append(chunks[i])
+                                    i += 1
+                            else:
+                                final_chunks.append(chunks[i])
+                                i += 1
+                        
+                        chunks = final_chunks
+                    
+                    return chunks
+                
+                # Apply semantic chunking to text documents
+                text_splits = []
+                for doc in text_docs:
+                    print(f"Semantically chunking document: {doc.metadata.get('source', 'unknown')}")
+                    chunks = semantic_chunk_text(doc.page_content, embeddings)
                     for i, chunk in enumerate(chunks):
                         from langchain_core.documents import Document
                         chunk_doc = Document(
                             page_content=chunk,
-                            metadata=group_docs[0].metadata.copy()
+                            metadata=doc.metadata.copy()
                         )
-                        chunk_doc.metadata['image_count'] = len(group_docs)
-                        chunk_doc.metadata['image_ids'] = [doc.metadata.get('image_id', '') for doc in group_docs]
                         chunk_doc.metadata['chunk_id'] = i
                         chunk_doc.metadata['total_chunks'] = len(chunks)
                         chunk_doc.metadata['chunking_method'] = 'semantic'
-                        image_splits.append(chunk_doc)
-        
-        # Combine all splits
-        all_splits = text_splits + image_splits
-        
-        st.info(f"📊 Created {len(text_splits)} semantic text chunks from {len(text_docs)} text documents and {len(image_splits)} semantic image chunks from {len(image_docs)} image descriptions")
-        
-        # Create vector store
-        vectorstore = OpenSearchVectorSearch(
-            embedding_function=embeddings,
-            opensearch_url=OPENSEARCH_URL,
-            index_name=OPENSEARCH_INDEX,
-            vector_field="vector_field",
-            http_auth=(OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD) if OPENSEARCH_USERNAME else None,
-            use_ssl=OPENSEARCH_URL.startswith('https'),
-            verify_certs=False,
-            engine="lucene"
-        )
+                        text_splits.append(chunk_doc)
+                
+                # For image descriptions, group by source and page for better organization
+                image_splits = []
+                if image_docs:
+                    # Group images by source and page
+                    image_groups = {}
+                    for img_doc in image_docs:
+                        source = img_doc.metadata.get('source', 'unknown')
+                        page = img_doc.metadata.get('page', 0)
+                        key = f"{source}_page_{page}"
+                        
+                        if key not in image_groups:
+                            image_groups[key] = []
+                        image_groups[key].append(img_doc)
+                    
+                    # Process each group semantically
+                    for key, group_docs in image_groups.items():
+                        if len(group_docs) == 1:
+                            # Single image, keep as-is
+                            image_splits.extend(group_docs)
+                        else:
+                            # Multiple images on same page, combine and apply semantic chunking
+                            combined_content = "\n\n".join([doc.page_content for doc in group_docs])
+                            chunks = semantic_chunk_text(combined_content, embeddings, chunk_size=1000, overlap=200)
+                            
+                            for i, chunk in enumerate(chunks):
+                                from langchain_core.documents import Document
+                                chunk_doc = Document(
+                                    page_content=chunk,
+                                    metadata=group_docs[0].metadata.copy()
+                                )
+                                chunk_doc.metadata['image_count'] = len(group_docs)
+                                chunk_doc.metadata['image_ids'] = [doc.metadata.get('image_id', '') for doc in group_docs]
+                                chunk_doc.metadata['chunk_id'] = i
+                                chunk_doc.metadata['total_chunks'] = len(chunks)
+                                chunk_doc.metadata['chunking_method'] = 'semantic'
+                                image_splits.append(chunk_doc)
+                
+                # Combine all splits
+                all_splits = text_splits + image_splits
+                
+                if all_splits:
+                    st.info(f"📊 Created {len(text_splits)} semantic text chunks from {len(text_docs)} text documents and {len(image_splits)} semantic image chunks from {len(image_docs)} image descriptions")
+                    
+                    # Create vector store
+                    vectorstore = OpenSearchVectorSearch(
+                        embedding_function=embeddings,
+                        opensearch_url=OPENSEARCH_URL,
+                        index_name=OPENSEARCH_INDEX,
+                        vector_field="vector_field",
+                        http_auth=(OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD) if OPENSEARCH_USERNAME else None,
+                        use_ssl=OPENSEARCH_URL.startswith('https'),
+                        verify_certs=False,
+                        engine="lucene"
+                    )
 
-        # Add documents to vector store
-        print(f"Adding {len(all_splits)} total documents to vector store")
-        vectorstore.add_documents(all_splits)
+                    # Add documents to vector store
+                    print(f"Adding {len(all_splits)} total documents to vector store")
+                    vectorstore.add_documents(all_splits)
+                    
+                    # Set up QA chain
+                    st.session_state.vectorstore = vectorstore
+                    st.session_state.qa_chain = setup_qa_chain(vectorstore)
+                    st.session_state.processed_pdfs = True
+                else:
+                    print("⚠️ No document chunks created")
+                    st.warning("No document content could be processed for embeddings.")
+        else:
+            # No documents to process, but we might have sheets
+            if all_sheet_documents:
+                st.success(f"✅ Successfully processed {processed_count} files ({failed_count} failed)")
+                st.info("📊 No documents found, but sheets were processed successfully.")
+            else:
+                st.warning("No documents or sheets found to process.")
+        
+        # Process sheets with LlamaIndex
+        if all_sheet_documents:
+            st.info("📊 Processing sheets with LlamaIndex...")
+            
+            try:
+                sheets_query_engine = create_sheets_query_engine(all_sheet_documents)
+                if sheets_query_engine:
+                    st.session_state.sheets_query_engine = sheets_query_engine
+                    st.session_state.processed_sheets = True
+                    st.success("✅ Sheets query engine created successfully!")
+                else:
+                    st.error("❌ Failed to create sheets query engine")
+            except Exception as e:
+                st.error(f"❌ Error creating sheets query engine: {str(e)}")
         
         # Save updated metadata
         save_processed_files_metadata(processed_files, user_email)
         
         # Update session state
-        st.session_state.vectorstore = vectorstore
-        st.session_state.qa_chain = setup_qa_chain(vectorstore)
-        st.session_state.processed_pdfs = True
-        st.session_state.processing_status = "✅ Processing complete! You can now ask questions about your documents."
+        st.session_state.processing_status = "✅ Processing complete! You can now ask questions about your documents and sheets."
         
     except Exception as e:
         st.error(f"Error processing documents: {str(e)}")
@@ -1075,6 +1236,304 @@ def clear_metadata_and_reprocess(user_email):
         print(f"❌ Error clearing metadata: {str(e)}")
         return False
 
+def initialize_llamaindex_parser():
+    """Initialize the LlamaParse parser for sheets processing."""
+    try:
+        llama_key = os.getenv("LLAMA_CLOUD_API_KEY")
+        if not llama_key:
+            raise ValueError("LLAMA_CLOUD_API_KEY not found in environment variables")
+        return LlamaParse(api_key=llama_key, result_type="markdown")
+    except Exception as e:
+        print(f"Error initializing LlamaParse: {str(e)}")
+        return None
+
+def initialize_llamaindex_llm():
+    """Initialize the Google GenAI LLM for LlamaIndex."""
+    try:
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+        if not google_api_key:
+            raise ValueError("GOOGLE_API_KEY not found in environment variables")
+        return GoogleGenAI(model="gemini-2.0-flash-exp", api_key=google_api_key, temperature=0.3)
+    except Exception as e:
+        print(f"Error initializing LlamaIndex LLM: {str(e)}")
+        return None
+
+def initialize_llamaindex_embeddings():
+    """Initialize the Google GenAI Embeddings for LlamaIndex."""
+    try:
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+        if not google_api_key:
+            raise ValueError("GOOGLE_API_KEY not found in environment variables")
+        return GoogleGenAIEmbedding(model_name="embedding-001", api_key=google_api_key)
+    except Exception as e:
+        print(f"Error initializing LlamaIndex embeddings: {str(e)}")
+        return None
+
+def create_sheets_query_engine(all_documents):
+    """Create and return the LlamaIndex query engine for sheets processing."""
+    try:
+        print("🔧 Initializing LlamaIndex components...")
+        
+        # Initialize components
+        llm = initialize_llamaindex_llm()
+        if not llm:
+            raise Exception("Failed to initialize LlamaIndex LLM")
+        
+        embeddings = initialize_llamaindex_embeddings()
+        if not embeddings:
+            raise Exception("Failed to initialize LlamaIndex embeddings")
+        
+        Settings.llm = llm
+        Settings.embed_model = embeddings
+        
+        print(f"📊 Processing {len(all_documents)} pre-processed sheet documents...")
+        
+        if not all_documents:
+            raise ValueError("No documents were provided for processing")
+        
+        print(f"📊 Total documents to process: {len(all_documents)}")
+        
+        # OpenSearch configuration for sheets
+        sheets_endpoint = os.getenv("OPENSEARCH_URL", "http://localhost:9200")
+        sheets_idx = "sheets_embeddings"
+        text_field = "content"
+        embedding_field = "embedding"
+        
+        # Create OpenSearch client
+        client = OpenSearch(
+            hosts=[sheets_endpoint],
+            http_auth=(OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD) if OPENSEARCH_USERNAME else None,
+            use_ssl=sheets_endpoint.startswith('https'),
+            verify_certs=False,
+            ssl_show_warn=False
+        )
+        
+        # Check if sheets index exists and has correct mapping
+        index_exists = client.indices.exists(index=sheets_idx)
+        should_recreate_index = False
+        
+        if index_exists:
+            try:
+                current_mapping = client.indices.get_mapping(index=sheets_idx)
+                properties = current_mapping[sheets_idx]['mappings']['properties']
+                
+                if embedding_field not in properties or properties[embedding_field]['type'] != 'knn_vector':
+                    print(f"Index {sheets_idx} exists but embedding field is not correctly configured. Recreating...")
+                    should_recreate_index = True
+                else:
+                    print(f"Index {sheets_idx} exists with correct mapping.")
+            except Exception as e:
+                print(f"Error checking index mapping: {e}. Recreating index...")
+                should_recreate_index = True
+        
+        # Delete index if it needs to be recreated
+        if should_recreate_index and index_exists:
+            client.indices.delete(index=sheets_idx)
+            print(f"Deleted existing index {sheets_idx}")
+        
+        # Create index if it doesn't exist or was deleted
+        if not index_exists or should_recreate_index:
+            index_settings = {
+                "settings": {
+                    "index": {
+                        "knn": True,
+                        "knn.algo_param.ef_search": 100
+                    }
+                },
+                "mappings": {
+                    "properties": {
+                        text_field: {"type": "text"},
+                        embedding_field: {
+                            "type": "knn_vector",
+                            "dimension": 768,
+                            "method": {
+                                "name": "hnsw",
+                                "engine": "lucene",
+                                "parameters": {
+                                    "ef_construction": 128,
+                                    "m": 16
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            client.indices.create(index=sheets_idx, body=index_settings)
+            print(f"Created new index {sheets_idx} with correct mapping")
+        
+        # Create vector store
+        vector_client = OpensearchVectorClient(
+            sheets_endpoint,
+            sheets_idx,
+            768,
+            embedding_field=embedding_field,
+            text_field=text_field
+        )
+        vector_store = OpensearchVectorStore(vector_client)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        
+        # Create index from documents
+        index = VectorStoreIndex.from_documents(
+            documents=all_documents,
+            storage_context=storage_context,
+            embed_model=embeddings
+        )
+        
+        # Define custom system prompt for sheets
+        custom_prompt = PromptTemplate(
+            "You are a helpful AI assistant that specializes in analyzing and interpreting data from Excel sheets and spreadsheets. "
+            "When responding to queries:\n"
+            "1. Always provide clear, concise, and accurate answers based on the retrieved context\n"
+            "2. If the information is not available in the context, clearly state that\n"
+            "3. Use bullet points or numbered lists when presenting multiple pieces of information\n"
+            "4. Include relevant data points, numbers, or specific details when available\n"
+            "5. Maintain a professional and helpful tone\n"
+            "6. If asked for analysis, provide insights and explanations, not just raw data\n"
+            "7. Consider the conversation history when providing context and follow-up information\n"
+            "8. When dealing with numerical data, provide context and trends\n"
+            "9. If asked about specific cells, rows, or columns, reference them clearly\n\n"
+            "Context information is below.\n"
+            "---------------------\n"
+            "{context_str}\n"
+            "---------------------\n"
+            "Given this information, please answer the following question: {query_str}\n"
+            "Answer: "
+        )
+        
+        # Create base query engine
+        base_query_engine = index.as_query_engine(
+            llm=llm, 
+            response_mode="tree_summarize",
+            text_qa_template=custom_prompt
+        )
+        
+        # Create conversation memory
+        memory = ChatMemoryBuffer.from_defaults(token_limit=1500)
+        
+        # Create condense question prompt for conversation context
+        condense_question_prompt = PromptTemplate(
+            "Given the following conversation history and a new question, rephrase the new question "
+            "to be a standalone question that captures all relevant context from the conversation history.\n\n"
+            "Conversation History:\n{chat_history}\n\n"
+            "New Question: {question}\n\n"
+            "Standalone Question: "
+        )
+        
+        # Create chat engine with memory
+        chat_engine = CondenseQuestionChatEngine.from_defaults(
+            query_engine=base_query_engine,
+            condense_question_prompt=condense_question_prompt,
+            memory=memory,
+            llm=llm,
+            verbose=True
+        )
+        
+        print("✅ Sheets query engine created successfully")
+        return chat_engine
+        
+    except Exception as e:
+        print(f"❌ Error creating sheets query engine: {str(e)}")
+        print("Detailed error:")
+        print(traceback.format_exc())
+        return None
+
+def combine_responses_from_dual_systems(prompt, qa_chain_response, sheets_response, llm):
+    """Combine responses from both LangChain QA chain and LlamaIndex sheets query engine."""
+    try:
+        # Create a prompt to combine the responses
+        combine_prompt = f"""
+You are an AI assistant that combines information from two different sources:
+1. Document/PDF/Image analysis (LangChain response)
+2. Spreadsheet/Excel data analysis (LlamaIndex response)
+
+Your task is to create a comprehensive, well-structured response that:
+- Integrates information from both sources when relevant
+- Eliminates redundancy while preserving important details
+- Maintains clarity and organization
+- Prioritizes the most relevant information for the user's question
+- Clearly indicates which source provided which information when helpful
+
+User Question: {prompt}
+
+Document/PDF/Image Analysis Response:
+{qa_chain_response if qa_chain_response else "No relevant information found in documents, PDFs, or images."}
+
+Spreadsheet/Excel Data Analysis Response:
+{sheets_response if sheets_response else "No relevant information found in spreadsheets or Excel files."}
+
+Please provide a comprehensive answer that combines these responses intelligently:
+"""
+        
+        # Get combined response from LLM
+        response = llm.invoke(combine_prompt)
+        return response.content
+        
+    except Exception as e:
+        print(f"Error combining responses: {str(e)}")
+        # Fallback: return the better of the two responses
+        if qa_chain_response and sheets_response:
+            return f"**Document Analysis:**\n{qa_chain_response}\n\n**Spreadsheet Analysis:**\n{sheets_response}"
+        elif qa_chain_response:
+            return qa_chain_response
+        elif sheets_response:
+            return sheets_response
+        else:
+            return "I couldn't find relevant information in your documents or spreadsheets."
+
+def query_dual_systems(prompt, qa_chain, sheets_query_engine):
+    """Query both LangChain QA chain and LlamaIndex sheets query engine."""
+    try:
+        qa_response = None
+        sheets_response = None
+        
+        # Query LangChain QA chain (for PDFs, images, docs)
+        if qa_chain:
+            try:
+                print("🔍 Querying LangChain QA chain...")
+                qa_result = qa_chain.invoke({"input": prompt})
+                qa_response = qa_result.get("answer", None)
+                print("✅ LangChain response received")
+            except Exception as e:
+                print(f"❌ Error querying LangChain QA chain: {str(e)}")
+                qa_response = None
+        
+        # Query LlamaIndex sheets query engine
+        if sheets_query_engine:
+            try:
+                print("📊 Querying LlamaIndex sheets query engine...")
+                sheets_result = sheets_query_engine.chat(prompt)
+                sheets_response = sheets_result.response
+                print("✅ LlamaIndex response received")
+            except Exception as e:
+                print(f"❌ Error querying LlamaIndex sheets query engine: {str(e)}")
+                sheets_response = None
+        
+        # If we have both responses, combine them
+        if qa_response and sheets_response:
+            print("🔄 Combining responses from both systems...")
+            # Initialize LLM for response combination
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-1.5-flash",
+                google_api_key=GOOGLE_API_KEY,
+                temperature=0.3
+            )
+            combined_response = combine_responses_from_dual_systems(
+                prompt, qa_response, sheets_response, llm
+            )
+            return combined_response
+        
+        # If we only have one response, return it
+        elif qa_response:
+            return qa_response
+        elif sheets_response:
+            return sheets_response
+        else:
+            return "I couldn't find relevant information in your documents or spreadsheets."
+            
+    except Exception as e:
+        print(f"❌ Error in dual query system: {str(e)}")
+        return f"An error occurred while processing your query: {str(e)}"
+
 def main():
     st.set_page_config(
         page_title="AI Document Assistant",
@@ -1170,11 +1629,19 @@ def main():
                 client = create_opensearch_client()
                 if client and client.indices.exists(index=OPENSEARCH_INDEX):
                     client.indices.delete(index=OPENSEARCH_INDEX)
-                    st.session_state.processed_pdfs = False
-                    st.session_state.vectorstore = None
-                    st.session_state.qa_chain = None
-                    st.session_state.start_chatting = False
-                    st.success("✅ All data cleared!")
+                
+                # Clear sheets index if it exists
+                if client and client.indices.exists(index="sheets_embeddings"):
+                    client.indices.delete(index="sheets_embeddings")
+                
+                # Reset session state
+                st.session_state.processed_pdfs = False
+                st.session_state.processed_sheets = False
+                st.session_state.vectorstore = None
+                st.session_state.qa_chain = None
+                st.session_state.sheets_query_engine = None
+                st.session_state.start_chatting = False
+                st.success("✅ All data cleared!")
                 
                 st.rerun()
         
@@ -1200,8 +1667,10 @@ def main():
         # Debug information (can be removed later)
         with st.expander("🔧 Debug Info"):
             st.write(f"processed_pdfs: {st.session_state.processed_pdfs}")
+            st.write(f"processed_sheets: {st.session_state.processed_sheets}")
             st.write(f"start_chatting: {st.session_state.start_chatting}")
             st.write(f"has_qa_chain: {st.session_state.qa_chain is not None}")
+            st.write(f"has_sheets_query_engine: {st.session_state.sheets_query_engine is not None}")
             st.write(f"has_vectorstore: {st.session_state.vectorstore is not None}")
             st.write(f"document_count: {doc_count}")
         
@@ -1210,16 +1679,21 @@ def main():
         st.markdown("""
         This app processes your Google Drive documents using:
         
+        **Document Processing (LangChain):**
         - **Semantic Chunking**: Advanced AI-powered text splitting
         - **Gemini Vision**: Image analysis and description
         - **OpenSearch**: Vector storage and retrieval
-        - **Streamlit**: Interactive web interface
         
-        Supports: PDF files and Google Docs
+        **Sheets Processing (LlamaIndex):**
+        - **LlamaParse**: Advanced spreadsheet parsing
+        - **Dual-Query System**: Combines document and sheet analysis
+        - **Intelligent Response Merging**: Seamless integration of multiple sources
+        
+        **Supports:** PDF files, Google Docs, Excel files, and Google Sheets
         """)
     
     # Main content area
-    if not st.session_state.processed_pdfs and not st.session_state.start_chatting:
+    if not st.session_state.processed_pdfs and not st.session_state.processed_sheets and not st.session_state.start_chatting:
         # Check if there are existing documents in OpenSearch
         has_existing_docs = check_existing_documents()
         
@@ -1238,14 +1712,14 @@ def main():
                             st.error("❌ Failed to initialize chat interface.")
             
             st.markdown("---")
-            st.markdown("**Or** click 'Process Documents' in the sidebar to scan for new documents in your Google Drive.")
+            st.markdown("**Or** click 'Process Documents' in the sidebar to scan for new documents and sheets in your Google Drive.")
         else:
-            st.info("📚 No documents processed yet. Click 'Process Documents' in the sidebar to get started.")
+            st.info("📚 No documents or sheets processed yet. Click 'Process Documents' in the sidebar to get started.")
         return
     
     # Chat interface
-    if st.session_state.processed_pdfs or st.session_state.start_chatting:
-        st.header("💬 Ask Questions About Your Documents")
+    if st.session_state.processed_pdfs or st.session_state.start_chatting or st.session_state.processed_sheets:
+        st.header("💬 Ask Questions About Your Documents & Sheets")
         
         # Initialize chat history
         if "messages" not in st.session_state:
@@ -1257,7 +1731,7 @@ def main():
                 st.markdown(message["content"])
         
         # Chat input
-        if prompt := st.chat_input("Ask a question about your documents..."):
+        if prompt := st.chat_input("Ask a question about your documents and sheets..."):
             # Add user message to chat history
             st.session_state.messages.append({"role": "user", "content": prompt})
             
@@ -1265,15 +1739,22 @@ def main():
             with st.chat_message("user"):
                 st.markdown(prompt)
             
-            # Generate response
+            # Generate response using dual-query system
             with st.chat_message("assistant"):
                 message_placeholder = st.empty()
                 
                 try:
-                    if st.session_state.qa_chain:
-                        # Get response from QA chain
-                        response = st.session_state.qa_chain.invoke({"input": prompt})
-                        answer = response.get("answer", "Sorry, I couldn't find an answer.")
+                    # Check if we have either QA chain or sheets query engine
+                    has_qa_chain = st.session_state.qa_chain is not None
+                    has_sheets_engine = st.session_state.sheets_query_engine is not None
+                    
+                    if has_qa_chain or has_sheets_engine:
+                        # Use dual-query system
+                        answer = query_dual_systems(
+                            prompt, 
+                            st.session_state.qa_chain, 
+                            st.session_state.sheets_query_engine
+                        )
                         
                         # Display response
                         message_placeholder.markdown(answer)
@@ -1281,7 +1762,7 @@ def main():
                         # Add assistant response to chat history
                         st.session_state.messages.append({"role": "assistant", "content": answer})
                     else:
-                        message_placeholder.error("❌ QA chain not initialized. Please process documents first.")
+                        message_placeholder.error("❌ No query engines initialized. Please process documents and sheets first.")
                 except Exception as e:
                     message_placeholder.error(f"❌ Error generating response: {str(e)}")
         
