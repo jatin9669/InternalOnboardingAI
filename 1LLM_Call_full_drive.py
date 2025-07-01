@@ -116,6 +116,8 @@ def classify_query(query):
         - "What does document X say about Y?"
         - "Find information about Z"
         - "What are the key points in document A?"
+        - "Explain the data in the spreadsheet"
+        - "What does this document contain?"
         
         **METADATA queries typically ask about:**
         - File properties (name, size, date, type)
@@ -124,11 +126,29 @@ def classify_query(query):
         - File types, formats, or categories
         - When files were processed or modified
         - File relationships or hierarchy
+        - **Finding specific files by name or description**
+        - **Locating files that contain certain topics**
+        - **File permissions and access control**
         - "How many PDF files do I have?"
         - "What files were processed recently?"
         - "Show me all Google Docs"
         - "What's the largest file?"
         - "When was document X last modified?"
+        - "Find me the file which talks about the topic Y"
+        - "Find me the file named Z"
+        - "Which file contains information about X?"
+        - "Show me files about Y"
+        - "Find documents related to Z"
+        - "What files do I have about topic A?"
+        - "Who has access to file X?"
+        - "Who can edit this document?"
+        - "What are the permissions for file Y?"
+        - "Who all have access to this file?"
+        - "Show me who can view this document"
+        
+        **Key distinction:**
+        - **CONTENT**: Asks "What does the document say?" or "What information is in the document?"
+        - **METADATA**: Asks "Which file contains this?" or "Find me the file that has this" or "What files do I have about this?"
         
         **Query to classify:** "{query}"
         
@@ -180,15 +200,21 @@ def fallback_query_classification(query):
         'when', 'date', 'time', 'modified', 'created', 'processed',
         'recent', 'oldest', 'newest', 'largest', 'smallest',
         'show me all', 'list', 'what files', 'which files',
-        'file properties', 'metadata', 'structure', 'organization'
+        'file properties', 'metadata', 'structure', 'organization',
+        'find me the file', 'find the file', 'which file', 'what file',
+        'show me files', 'find documents', 'locate file', 'file named',
+        'file that contains', 'file about', 'documents about',
+        'who has access', 'who can', 'permissions', 'access', 'shared',
+        'who all', 'who can edit', 'who can view', 'who can read'
     ]
     
     # Content keywords
     content_keywords = [
-        'what does', 'what is', 'what are', 'find', 'search',
+        'what does', 'what is', 'what are', 'find information', 'search for',
         'information about', 'data about', 'content', 'says',
         'explain', 'describe', 'analyze', 'summarize', 'key points',
-        'topics', 'subjects', 'details', 'facts', 'information'
+        'topics', 'subjects', 'details', 'facts', 'information',
+        'what does it say', 'what does this contain', 'what is in'
     ]
     
     metadata_score = sum(1 for keyword in metadata_keywords if keyword in query_lower)
@@ -354,11 +380,16 @@ def handle_metadata_query(query, user_email):
                 "type": file_data.get('file_type', 'Unknown'),
                 "size_mb": file_data.get('file_size_mb', 0),
                 "modified": file_data.get('modified_time', 'Unknown'),
+                "last_opened": file_data.get('last_opened_time', 'Unknown'),
                 "processed": file_data.get('processed_time', 'Unknown'),
                 "chunks": file_data.get('total_chunks', 0),
                 "page_count": file_data.get('page_count', 0),
                 "word_count": file_data.get('word_count', 0),
-                "sheet_count": file_data.get('sheet_count', 0)
+                "sheet_count": file_data.get('sheet_count', 0),
+                "web_link": file_data.get('web_view_link', ''),
+                "owners": file_data.get('owners', []),
+                "permissions": file_data.get('permissions', []),
+                "shared": file_data.get('shared', False)
             }
             files_summary.append(summary)
         
@@ -373,12 +404,37 @@ def handle_metadata_query(query, user_email):
         
         **TOTAL FILES:** {len(files_summary)}
         
+        **PERMISSIONS DATA STRUCTURE:**
+        Each file has two permission-related fields:
+        - **owners**: Contains the file owner(s) - typically 1 person who created the file
+        - **permissions**: Contains ALL people who have access to the file, including:
+          * The owner (with role "owner")
+          * Users with specific access (with roles like "writer", "reader", "commenter")
+          * Domain-wide permissions (with type "domain")
+          * Group permissions (with type "group")
+          * Anyone with link access (with type "anyone")
+        
         **ANALYSIS TASK:**
         1. Understand what the user is asking about regarding their files
         2. Search through the metadata to find relevant information
         3. Provide a clear, organized response with specific details
         4. Include file names, sizes, dates, and counts as relevant
         5. Format the response in a user-friendly way with bullet points or tables
+        6. **IMPORTANT**: When mentioning any file, always include its web link in the format: "File Name ([🔗 Open in Drive](web_link))"
+        
+        **SPECIAL HANDLING FOR PERMISSION QUERIES:**
+        - When asked about "who has access" or "permissions" for a file, use the "permissions" field, NOT just "owners"
+        - List ALL people from the permissions array, not just the owner
+        - Include their roles (owner, writer, reader, commenter, etc.)
+        - For domain permissions, mention the domain name
+        - For group permissions, mention the group name
+        - Distinguish between individual users and broader access (domain/group/anyone)
+        
+        **SPECIAL HANDLING FOR FILE-FINDING QUERIES:**
+        - If the user is asking to find files by name, topic, or content, search through file names and metadata
+        - For topic-based searches, look for files that might contain relevant information based on their names and types
+        - If no exact matches are found, suggest similar files or explain what files are available
+        - Always provide the web link for any file mentioned
         
         **RESPONSE FORMAT:**
         - Be specific and include actual file names and numbers
@@ -386,6 +442,10 @@ def handle_metadata_query(query, user_email):
         - Include file sizes, dates, and counts where relevant
         - If the query asks for counts, provide exact numbers
         - If the query asks for specific files, list them with details
+        - **ALWAYS include web links** when mentioning files: "File Name ([🔗 Open in Drive](web_link))"
+        - If a file has no web link, just mention the file name
+        - For file-finding queries, clearly state what was found and provide direct links
+        - For permission queries, clearly list all people with access and their roles
         
         **ANSWER:**"""
         
@@ -634,7 +694,7 @@ def scan_entire_drive_for_pdfs(credentials):
             response = service.files().list(
                 q=query,
                 spaces='drive',
-                fields='nextPageToken, files(id, name, modifiedTime, viewedByMeTime, size)',
+                fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, viewedByMeTime, owners, permissions, webViewLink, webContentLink, thumbnailLink, parents, trashed, starred, shared, viewedByMe, capabilities, exportLinks, appProperties, properties, imageMediaMetadata, videoMediaMetadata)',
                 pageToken=page_token
             ).execute()
             
@@ -665,7 +725,7 @@ def scan_entire_drive_for_docs(credentials):
             response = service.files().list(
                 q=query,
                 spaces='drive',
-                fields='nextPageToken, files(id, name, modifiedTime, viewedByMeTime, size)',
+                fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, viewedByMeTime, owners, permissions, webViewLink, webContentLink, thumbnailLink, parents, trashed, starred, shared, viewedByMe, capabilities, exportLinks, appProperties, properties, imageMediaMetadata, videoMediaMetadata)',
                 pageToken=page_token
             ).execute()
             
@@ -698,7 +758,7 @@ def scan_entire_drive_for_sheets(credentials):
             response = service.files().list(
                 q=excel_query,
                 spaces='drive',
-                fields='nextPageToken, files(id, name, modifiedTime, viewedByMeTime, size)',
+                fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, viewedByMeTime, owners, permissions, webViewLink, webContentLink, thumbnailLink, parents, trashed, starred, shared, viewedByMe, capabilities, exportLinks, appProperties, properties, imageMediaMetadata, videoMediaMetadata)',
                 pageToken=page_token
             ).execute()
             
@@ -714,7 +774,7 @@ def scan_entire_drive_for_sheets(credentials):
             response = service.files().list(
                 q=google_sheets_query,
                 spaces='drive',
-                fields='nextPageToken, files(id, name, modifiedTime, viewedByMeTime, size)',
+                fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, viewedByMeTime, owners, permissions, webViewLink, webContentLink, thumbnailLink, parents, trashed, starred, shared, viewedByMe, capabilities, exportLinks, appProperties, properties, imageMediaMetadata, videoMediaMetadata)',
                 pageToken=page_token
             ).execute()
             
@@ -778,6 +838,7 @@ def download_google_doc_content(service, file_id, file_name, file_info=None):
                 'type': 'text',
                 'file_id': file_id,
                 'file_type': 'google_doc',
+                'drive_link': file_info.get('webViewLink', '') if file_info else '',
                 'processed_time': datetime.now().isoformat()
             }
         )
@@ -909,6 +970,7 @@ def process_pdf_with_images(pdf_path, file_name, file_id, file_info=None):
                     "source": file_name,
                     "page": page["page"],
                     "file_id": file_id,
+                    "drive_link": file_info.get('webViewLink', '') if file_info else '',
                     "type": "text"
                 }
                 documents.append(Document(page_content=combined_text, metadata=metadata))
@@ -932,6 +994,7 @@ def process_pdf_with_images(pdf_path, file_name, file_id, file_info=None):
                 "page": img_result["page"],
                 "file_id": file_id,
                 "image_id": img_result["image_id"],
+                "drive_link": file_info.get('webViewLink', '') if file_info else '',
                 "type": "image"
             }
             documents.append(Document(page_content=img_result["description"], metadata=metadata))
@@ -1118,7 +1181,10 @@ def create_unified_response(pdf_chunks, sheets_chunks, query, llm, chat_history=
                 source = chunk['metadata'].get('source', 'Unknown')
                 page = chunk['metadata'].get('page', 'N/A')
                 content_type = chunk['metadata'].get('type', 'text')
+                drive_link = chunk['metadata'].get('web_view_link', '')
                 pdf_context += f"\n--- Chunk {i} (Source: {source}, Page: {page}, Type: {content_type}) ---\n"
+                if drive_link:
+                    pdf_context += f"🔗 Drive Link: {drive_link}\n"
                 pdf_context += chunk['content'] + "\n"
         
         # Prepare context from sheet chunks
@@ -1127,7 +1193,10 @@ def create_unified_response(pdf_chunks, sheets_chunks, query, llm, chat_history=
             sheets_context = "\n**SPREADSHEETS & EXCEL FILES:**\n"
             for i, chunk in enumerate(sheets_chunks, 1):
                 source = chunk['metadata'].get('source', 'Unknown')
+                drive_link = chunk['metadata'].get('web_view_link', '')
                 sheets_context += f"\n--- Chunk {i} (Source: {source}) ---\n"
+                if drive_link:
+                    sheets_context += f"🔗 Drive Link: {drive_link}\n"
                 sheets_context += chunk['content'] + "\n"
         
         # Prepare conversation history
@@ -1152,12 +1221,14 @@ You are an advanced AI assistant with comprehensive access to information from b
 - **Cite sources properly** by mentioning document names and content types
 - **Maintain conversation flow** by referencing previous exchanges appropriately
 - **Provide comprehensive insights** by combining text and visual information
+- **Include web links** when mentioning files: "File Name ([🔗 Open in Drive](web_link))"
 
 ### 🔍 Information Sources
 - **Text Content**: Extracted from PDFs, Google Docs, and spreadsheets
 - **Visual Content**: Image descriptions, diagrams, charts, and visual elements
 - **Structured Data**: Numerical data, tables, and spreadsheet information
 - **Metadata**: File sources, page numbers, and processing timestamps
+- **Web Links**: Direct links to files in Google Drive
 
 ## 📊 CONTEXT INFORMATION
 
@@ -1199,6 +1270,7 @@ You are an advanced AI assistant with comprehensive access to information from b
 - **Format as clickable links** using proper markdown syntax
 - **Reference both section names and links** when discussing specific content
 - **Maintain link integrity** throughout the response
+- **When mentioning files, include their web links**: "File Name ([🔗 Open in Drive](web_link))"
 
 ## 📝 RESPONSE STRUCTURE GUIDELINES
 
@@ -1208,6 +1280,7 @@ You are an advanced AI assistant with comprehensive access to information from b
 3. **Context Integration**: Use conversation history for follow-up questions
 4. **Data Presentation**: Use bullet points or numbered lists for multiple items
 5. **Professional Tone**: Maintain helpful and informative communication style
+6. **Web Links**: Include file links when mentioning documents: "File Name ([🔗 Open in Drive](web_link))"
 
 ### 📊 Data Analysis Approach
 - **Numerical Context**: Provide trends and context for numerical data
@@ -1228,6 +1301,7 @@ You are an advanced AI assistant with comprehensive access to information from b
 - **Be concise and precise** in all responses
 - **Cite sources exactly once** for each piece of information
 - **Clearly state** when information is not available in the context
+- **Include web links** when mentioning files: "File Name ([🔗 Open in Drive](web_link))"
 
 ## 🎯 CURRENT QUERY
 
@@ -1242,6 +1316,7 @@ Based on the comprehensive context provided above, generate a well-structured re
 3. **Maintains conversation continuity** using the provided history
 4. **Follows all formatting and citation guidelines**
 5. **Provides actionable insights** when applicable
+6. **Includes web links** when mentioning files: "File Name ([🔗 Open in Drive](web_link))"
 
 **ANSWER:**"""
 
@@ -1417,6 +1492,13 @@ def process_all_user_documents_unified(credentials, user_email):
                             if parser:
                                 sheet_documents = parser.load_data(sheet_path)
                                 if sheet_documents:
+                                    # Add drive_link metadata to each sheet document
+                                    for doc in sheet_documents:
+                                        if hasattr(doc, 'metadata'):
+                                            doc.metadata['drive_link'] = sheet_file.get('webViewLink', '')
+                                        else:
+                                            doc.metadata = {'drive_link': sheet_file.get('webViewLink', '')}
+                                    
                                     all_sheet_documents.extend(sheet_documents)
                                     processed_count += 1
                                     print(f"✅ Successfully processed {file_name}: {len(sheet_documents)} documents")
