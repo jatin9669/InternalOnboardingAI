@@ -84,6 +84,318 @@ if 'start_chatting' not in st.session_state:
 
 print("🚀 Unified Document Assistant initialized")
 
+def classify_query(query):
+    """
+    Classify a query as either 'content' or 'metadata' based on its characteristics.
+    
+    Args:
+        query (str): The user's query
+        
+    Returns:
+        dict: Classification result with type and confidence
+    """
+    try:
+        # Initialize LLM for classification
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.1
+        )
+        
+        classification_prompt = f"""
+        You are a query classifier for a document management system. Your task is to determine whether a user's query is asking about:
+        
+        1. **CONTENT** - Questions about the actual content, information, or data within documents
+        2. **METADATA** - Questions about file properties, structure, organization, or file management
+        
+        **CONTENT queries typically ask about:**
+        - What information is in the documents
+        - Specific data, facts, or content
+        - Analysis of document content
+        - Questions about topics, subjects, or information within files
+        - "What does document X say about Y?"
+        - "Find information about Z"
+        - "What are the key points in document A?"
+        
+        **METADATA queries typically ask about:**
+        - File properties (name, size, date, type)
+        - File organization and structure
+        - Number of files, document counts
+        - File types, formats, or categories
+        - When files were processed or modified
+        - File relationships or hierarchy
+        - "How many PDF files do I have?"
+        - "What files were processed recently?"
+        - "Show me all Google Docs"
+        - "What's the largest file?"
+        - "When was document X last modified?"
+        
+        **Query to classify:** "{query}"
+        
+        Respond with a JSON object in this exact format:
+        {{
+            "classification": "content" or "metadata",
+            "confidence": 0.0-1.0,
+            "reasoning": "brief explanation of why this classification was chosen"
+        }}
+        
+        **Response (JSON only):**
+        """
+        
+        response = llm.invoke(classification_prompt)
+        response_text = response.content.strip()
+        
+        # Extract JSON from response
+        try:
+            # Try to find JSON in the response
+            if '{' in response_text and '}' in response_text:
+                start = response_text.find('{')
+                end = response_text.rfind('}') + 1
+                json_str = response_text[start:end]
+                result = json.loads(json_str)
+            else:
+                # Fallback classification based on keywords
+                result = fallback_query_classification(query)
+            
+            return result
+            
+        except json.JSONDecodeError:
+            # Fallback to keyword-based classification
+            return fallback_query_classification(query)
+            
+    except Exception as e:
+        print(f"Error in query classification: {str(e)}")
+        return fallback_query_classification(query)
+
+def fallback_query_classification(query):
+    """
+    Fallback classification using keyword matching when LLM classification fails.
+    """
+    query_lower = query.lower()
+    
+    # Metadata keywords
+    metadata_keywords = [
+        'how many', 'count', 'number of', 'files', 'documents',
+        'file type', 'file size', 'file name', 'file format',
+        'when', 'date', 'time', 'modified', 'created', 'processed',
+        'recent', 'oldest', 'newest', 'largest', 'smallest',
+        'show me all', 'list', 'what files', 'which files',
+        'file properties', 'metadata', 'structure', 'organization'
+    ]
+    
+    # Content keywords
+    content_keywords = [
+        'what does', 'what is', 'what are', 'find', 'search',
+        'information about', 'data about', 'content', 'says',
+        'explain', 'describe', 'analyze', 'summarize', 'key points',
+        'topics', 'subjects', 'details', 'facts', 'information'
+    ]
+    
+    metadata_score = sum(1 for keyword in metadata_keywords if keyword in query_lower)
+    content_score = sum(1 for keyword in content_keywords if keyword in query_lower)
+    
+    if metadata_score > content_score:
+        return {
+            "classification": "metadata",
+            "confidence": 0.7,
+            "reasoning": "Keyword-based classification: query contains metadata-related terms"
+        }
+    else:
+        return {
+            "classification": "content",
+            "confidence": 0.7,
+            "reasoning": "Keyword-based classification: query appears to ask about content"
+        }
+
+def get_user_enhanced_metadata_path(user_email):
+    """Get user-specific enhanced metadata path for comprehensive file information."""
+    user_hash = hashlib.md5(user_email.encode()).hexdigest()
+    return f"vectorstores/user_{user_hash}_enhanced_metadata.json"
+
+def save_enhanced_file_metadata(file_metadata, user_email):
+    """Save comprehensive metadata about processed files."""
+    metadata_path = get_user_enhanced_metadata_path(user_email)
+    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+    
+    # Load existing metadata if it exists
+    existing_metadata = {}
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, 'r') as f:
+                existing_metadata = json.load(f)
+        except Exception as e:
+            print(f"Failed to load existing metadata: {e}")
+    
+    # Update with new metadata
+    existing_metadata.update(file_metadata)
+    
+    # Save updated metadata
+    with open(metadata_path, 'w') as f:
+        json.dump(existing_metadata, f, indent=2)
+    
+    print(f"✅ Enhanced metadata saved to {metadata_path}")
+
+def load_enhanced_file_metadata(user_email):
+    """Load comprehensive metadata about processed files."""
+    metadata_path = get_user_enhanced_metadata_path(user_email)
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Failed to load enhanced metadata: {e}")
+            return {}
+    return {}
+
+def extract_file_metadata(file_info, file_type, additional_info=None):
+    """
+    Extract comprehensive metadata from a file.
+    
+    Args:
+        file_info (dict): Basic file information from Google Drive
+        file_type (str): Type of file (pdf, google_doc, sheet)
+        additional_info (dict): Additional processing information
+        
+    Returns:
+        dict: Comprehensive file metadata
+    """
+    metadata = {
+        "file_id": file_info['id'],
+        "file_name": file_info['name'],
+        "file_type": file_type,
+        "mime_type": file_info.get('mimeType', ''),
+        "size": file_info.get('size', '0'),
+        "created_time": file_info.get('createdTime', ''),
+        "modified_time": file_info.get('modifiedTime', ''),
+        "last_opened_time": file_info.get('viewedByMeTime', ''),
+        "processed_time": datetime.now().isoformat(),
+        "owners": file_info.get('owners', []),
+        "permissions": file_info.get('permissions', []),
+        "web_view_link": file_info.get('webViewLink', ''),
+        "web_content_link": file_info.get('webContentLink', ''),
+        "thumbnail_link": file_info.get('thumbnailLink', ''),
+        "parents": file_info.get('parents', []),
+        "trashed": file_info.get('trashed', False),
+        "starred": file_info.get('starred', False),
+        "shared": file_info.get('shared', False),
+        "viewed_by_me_time": file_info.get('viewedByMeTime', ''),
+        "viewed_by_me": file_info.get('viewedByMe', False),
+        "capabilities": file_info.get('capabilities', {}),
+        "export_links": file_info.get('exportLinks', {}),
+        "app_properties": file_info.get('appProperties', {}),
+        "properties": file_info.get('properties', {}),
+        "image_media_metadata": file_info.get('imageMediaMetadata', {}),
+        "video_media_metadata": file_info.get('videoMediaMetadata', {}),
+        "processing_status": "completed",
+        "processing_errors": []
+    }
+    
+    # Add file-type specific metadata
+    if file_type == 'pdf':
+        metadata.update({
+            "page_count": additional_info.get('page_count', 0),
+            "text_chunks": additional_info.get('text_chunks', 0),
+            "image_chunks": additional_info.get('image_chunks', 0),
+            "total_chunks": additional_info.get('total_chunks', 0),
+            "extracted_links": additional_info.get('extracted_links', []),
+            "has_images": additional_info.get('has_images', False),
+            "file_size_mb": round(int(metadata['size']) / (1024 * 1024), 2) if metadata['size'] != '0' else 0
+        })
+    elif file_type == 'google_doc':
+        metadata.update({
+            "word_count": additional_info.get('word_count', 0),
+            "character_count": additional_info.get('character_count', 0),
+            "text_chunks": additional_info.get('text_chunks', 0),
+            "total_chunks": additional_info.get('text_chunks', 0),
+            "file_size_mb": round(int(metadata['size']) / (1024 * 1024), 2) if metadata['size'] != '0' else 0
+        })
+    elif file_type == 'sheet':
+        metadata.update({
+            "sheet_count": additional_info.get('sheet_count', 0),
+            "row_count": additional_info.get('row_count', 0),
+            "column_count": additional_info.get('column_count', 0),
+            "text_chunks": additional_info.get('text_chunks', 0),
+            "total_chunks": additional_info.get('text_chunks', 0),
+            "file_size_mb": round(int(metadata['size']) / (1024 * 1024), 2) if metadata['size'] != '0' else 0
+        })
+    
+    return metadata
+
+def handle_metadata_query(query, user_email):
+    """
+    Handle metadata-based queries by searching through stored file metadata.
+    
+    Args:
+        query (str): The metadata query
+        user_email (str): User's email for accessing their metadata
+        
+    Returns:
+        str: Formatted response based on metadata
+    """
+    try:
+        # Load enhanced metadata
+        metadata = load_enhanced_file_metadata(user_email)
+        
+        if not metadata:
+            return "❌ No file metadata found. Please process your documents first."
+        
+        # Initialize LLM for metadata analysis
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.3
+        )
+        
+        # Convert metadata to a more readable format for the LLM
+        files_summary = []
+        for file_hash, file_data in metadata.items():
+            summary = {
+                "name": file_data.get('file_name', 'Unknown'),
+                "type": file_data.get('file_type', 'Unknown'),
+                "size_mb": file_data.get('file_size_mb', 0),
+                "modified": file_data.get('modified_time', 'Unknown'),
+                "processed": file_data.get('processed_time', 'Unknown'),
+                "chunks": file_data.get('total_chunks', 0),
+                "page_count": file_data.get('page_count', 0),
+                "word_count": file_data.get('word_count', 0),
+                "sheet_count": file_data.get('sheet_count', 0)
+            }
+            files_summary.append(summary)
+        
+        # Create metadata analysis prompt
+        metadata_prompt = f"""
+        You are a file management assistant. Analyze the following file metadata to answer the user's query.
+        
+        **USER QUERY:** {query}
+        
+        **FILE METADATA:**
+        {json.dumps(files_summary, indent=2)}
+        
+        **TOTAL FILES:** {len(files_summary)}
+        
+        **ANALYSIS TASK:**
+        1. Understand what the user is asking about regarding their files
+        2. Search through the metadata to find relevant information
+        3. Provide a clear, organized response with specific details
+        4. Include file names, sizes, dates, and counts as relevant
+        5. Format the response in a user-friendly way with bullet points or tables
+        
+        **RESPONSE FORMAT:**
+        - Be specific and include actual file names and numbers
+        - Use bullet points for lists
+        - Include file sizes, dates, and counts where relevant
+        - If the query asks for counts, provide exact numbers
+        - If the query asks for specific files, list them with details
+        
+        **ANSWER:**"""
+        
+        response = llm.invoke(metadata_prompt)
+        return response.content
+        
+    except Exception as e:
+        print(f"Error handling metadata query: {str(e)}")
+        return f"❌ Error processing metadata query: {str(e)}"
+
 def create_opensearch_client():
     """Create OpenSearch client connection."""
     try:
@@ -322,7 +634,7 @@ def scan_entire_drive_for_pdfs(credentials):
             response = service.files().list(
                 q=query,
                 spaces='drive',
-                fields='nextPageToken, files(id, name, modifiedTime, size)',
+                fields='nextPageToken, files(id, name, modifiedTime, viewedByMeTime, size)',
                 pageToken=page_token
             ).execute()
             
@@ -353,7 +665,7 @@ def scan_entire_drive_for_docs(credentials):
             response = service.files().list(
                 q=query,
                 spaces='drive',
-                fields='nextPageToken, files(id, name, modifiedTime, size)',
+                fields='nextPageToken, files(id, name, modifiedTime, viewedByMeTime, size)',
                 pageToken=page_token
             ).execute()
             
@@ -386,7 +698,7 @@ def scan_entire_drive_for_sheets(credentials):
             response = service.files().list(
                 q=excel_query,
                 spaces='drive',
-                fields='nextPageToken, files(id, name, modifiedTime, size)',
+                fields='nextPageToken, files(id, name, modifiedTime, viewedByMeTime, size)',
                 pageToken=page_token
             ).execute()
             
@@ -402,7 +714,7 @@ def scan_entire_drive_for_sheets(credentials):
             response = service.files().list(
                 q=google_sheets_query,
                 spaces='drive',
-                fields='nextPageToken, files(id, name, modifiedTime, size)',
+                fields='nextPageToken, files(id, name, modifiedTime, viewedByMeTime, size)',
                 pageToken=page_token
             ).execute()
             
@@ -435,7 +747,7 @@ def download_pdf_from_drive(service, file_id, file_name, download_dir):
         print(f"Failed to download {file_name}: {str(e)}")
         return None
 
-def download_google_doc_content(service, file_id, file_name):
+def download_google_doc_content(service, file_id, file_name, file_info=None):
     """Download Google Doc content as text."""
     try:
         # Export Google Doc as plain text
@@ -469,6 +781,29 @@ def download_google_doc_content(service, file_id, file_name):
                 'processed_time': datetime.now().isoformat()
             }
         )
+        
+        # Extract comprehensive metadata for storage
+        if file_info:
+            # Count words and characters
+            word_count = len(content.split())
+            character_count = len(content)
+            
+            additional_info = {
+                "word_count": word_count,
+                "character_count": character_count,
+                "text_chunks": 1,  # Google Docs are typically single chunks
+                "total_chunks": 1
+            }
+            
+            # Store enhanced metadata
+            file_hash = hashlib.md5(f"{file_id}_{file_info.get('modifiedTime', '')}".encode()).hexdigest()
+            enhanced_metadata = extract_file_metadata(file_info, 'google_doc', additional_info)
+            
+            # Get user email from session state
+            user_email = st.session_state.user_info.get('email', 'unknown') if hasattr(st, 'session_state') and st.session_state.user_info else 'unknown'
+            
+            # Save enhanced metadata
+            save_enhanced_file_metadata({file_hash: enhanced_metadata}, user_email)
         
         return doc
         
@@ -549,7 +884,7 @@ def extract_text_with_links(pdf_path):
         traceback.print_exc()
         return []
 
-def process_pdf_with_images(pdf_path, file_name, file_id):
+def process_pdf_with_images(pdf_path, file_name, file_id, file_info=None):
     """Process a PDF file to extract both text and images."""
     try:
         # Initialize Gemini Vision model
@@ -565,6 +900,7 @@ def process_pdf_with_images(pdf_path, file_name, file_id):
         # Process text documents
         from langchain_core.documents import Document
         text_doc_count = 0
+        all_links = []
         for page in extracted_pages:
             page_text = page["text"].strip()
             if page_text:  # Only create document if there's actual text
@@ -577,6 +913,7 @@ def process_pdf_with_images(pdf_path, file_name, file_id):
                 }
                 documents.append(Document(page_content=combined_text, metadata=metadata))
                 text_doc_count += 1
+                all_links.extend(page["links"])
                 print(f"✅ Created text document for page {page['page']} ({len(page_text)} characters)")
             else:
                 print(f"⚠️ No text found on page {page['page']}")
@@ -602,6 +939,27 @@ def process_pdf_with_images(pdf_path, file_name, file_id):
             print(f"✅ Added image document: {img_result['image_id']}")
         
         print(f"📊 Total documents created for {file_name}: {len(documents)} ({text_doc_count} text, {image_doc_count} images)")
+        
+        # Extract comprehensive metadata for storage
+        if file_info:
+            additional_info = {
+                "page_count": len(extracted_pages),
+                "text_chunks": text_doc_count,
+                "image_chunks": image_doc_count,
+                "total_chunks": len(documents),
+                "extracted_links": list(set(all_links)),  # Remove duplicates
+                "has_images": image_doc_count > 0
+            }
+            
+            # Store enhanced metadata
+            file_hash = hashlib.md5(f"{file_id}_{file_info.get('modifiedTime', '')}".encode()).hexdigest()
+            enhanced_metadata = extract_file_metadata(file_info, 'pdf', additional_info)
+            
+            # Get user email from session state
+            user_email = st.session_state.user_info.get('email', 'unknown') if hasattr(st, 'session_state') and st.session_state.user_info else 'unknown'
+            
+            # Save enhanced metadata
+            save_enhanced_file_metadata({file_hash: enhanced_metadata}, user_email)
         
         return documents
         
@@ -977,8 +1335,8 @@ def process_all_user_documents_unified(credentials, user_email):
                         failed_count += 1
                         continue
                     
-                    # Extract text and images
-                    pdf_docs = process_pdf_with_images(pdf_path, file_name, file_id)
+                    # Extract text and images with enhanced metadata
+                    pdf_docs = process_pdf_with_images(pdf_path, file_name, file_id, pdf_file)
                     if pdf_docs:
                         documents.extend(pdf_docs)
                         processed_count += 1
@@ -1013,8 +1371,8 @@ def process_all_user_documents_unified(credentials, user_email):
             try:
                 st.session_state.processing_status = f"📝 Processing Google Doc: {file_name}"
                 
-                # Download Google Doc content
-                doc = download_google_doc_content(service, file_id, file_name)
+                # Download Google Doc content with enhanced metadata
+                doc = download_google_doc_content(service, file_id, file_name, doc_file)
                 if doc:
                     documents.append(doc)
                     processed_count += 1
@@ -1062,6 +1420,19 @@ def process_all_user_documents_unified(credentials, user_email):
                                     all_sheet_documents.extend(sheet_documents)
                                     processed_count += 1
                                     print(f"✅ Successfully processed {file_name}: {len(sheet_documents)} documents")
+                                    
+                                    # Extract enhanced metadata for sheets
+                                    additional_info = {
+                                        "sheet_count": 1,  # Default, could be enhanced with actual sheet count
+                                        "row_count": 0,  # Could be enhanced with actual row count
+                                        "column_count": 0,  # Could be enhanced with actual column count
+                                        "text_chunks": len(sheet_documents),
+                                        "total_chunks": len(sheet_documents)
+                                    }
+                                    
+                                    # Store enhanced metadata
+                                    enhanced_metadata = extract_file_metadata(sheet_file, 'sheet', additional_info)
+                                    save_enhanced_file_metadata({file_hash: enhanced_metadata}, user_email)
                                     
                                     # Save metadata
                                     processed_files[file_hash] = {
@@ -1502,18 +1873,37 @@ def initialize_unified_retriever_from_existing():
         st.error(f"Error initializing unified retriever: {str(e)}")
         return False
 
-def query_unified_system(prompt, unified_retriever, llm, chat_history=None):
-    """Query the unified system using the new approach."""
+def query_unified_system(prompt, unified_retriever, llm, chat_history=None, user_email=None):
+    """Query the unified system using the new approach with query classification."""
     try:
         print("🔍 Querying unified system...")
         
-        # Retrieve relevant chunks from both sources with history context
-        pdf_chunks, sheets_chunks = unified_retriever.retrieve_relevant_chunks(prompt, chat_history=chat_history)
+        # Classify the query
+        print("🎯 Classifying query...")
+        classification = classify_query(prompt)
+        query_type = classification.get('classification', 'content')
+        confidence = classification.get('confidence', 0.0)
+        reasoning = classification.get('reasoning', 'No reasoning provided')
         
-        print(f"📄 Retrieved {len(pdf_chunks)} PDF chunks and {len(sheets_chunks)} sheet chunks")
+        print(f"📊 Query classified as: {query_type} (confidence: {confidence:.2f})")
+        print(f"💭 Reasoning: {reasoning}")
         
-        # Create unified response in a single LLM call with history
-        response = create_unified_response(pdf_chunks, sheets_chunks, prompt, llm, chat_history)
+        # Route query based on classification
+        if query_type == 'metadata':
+            print("📋 Handling metadata query...")
+            if user_email:
+                response = handle_metadata_query(prompt, user_email)
+            else:
+                response = "❌ User email not available for metadata query processing."
+        else:
+            print("📄 Handling content query...")
+            # Retrieve relevant chunks from both sources with history context
+            pdf_chunks, sheets_chunks = unified_retriever.retrieve_relevant_chunks(prompt, chat_history=chat_history)
+            
+            print(f"📄 Retrieved {len(pdf_chunks)} PDF chunks and {len(sheets_chunks)} sheet chunks")
+            
+            # Create unified response in a single LLM call with history
+            response = create_unified_response(pdf_chunks, sheets_chunks, prompt, llm, chat_history)
         
         print("✅ Unified response generated successfully")
         return response
@@ -1614,6 +2004,11 @@ def main():
                 if os.path.exists(metadata_path):
                     os.remove(metadata_path)
                 
+                # Clear enhanced metadata
+                enhanced_metadata_path = get_user_enhanced_metadata_path(user_email)
+                if os.path.exists(enhanced_metadata_path):
+                    os.remove(enhanced_metadata_path)
+                
                 # Clear OpenSearch indices
                 client = create_opensearch_client()
                 if client:
@@ -1653,6 +2048,40 @@ def main():
         if sheets_count > 0:
             st.success(f"📊 {sheets_count} sheet chunks in knowledge base")
         
+        # Show enhanced metadata information
+        enhanced_metadata = load_enhanced_file_metadata(user_email)
+        if enhanced_metadata:
+            with st.expander("📋 File Metadata Summary", expanded=False):
+                total_files = len(enhanced_metadata)
+                file_types = {}
+                total_size_mb = 0
+                total_chunks = 0
+                
+                for file_hash, file_data in enhanced_metadata.items():
+                    file_type = file_data.get('file_type', 'unknown')
+                    file_types[file_type] = file_types.get(file_type, 0) + 1
+                    total_size_mb += file_data.get('file_size_mb', 0)
+                    total_chunks += file_data.get('total_chunks', 0)
+                
+                st.write(f"**Total Files:** {total_files}")
+                st.write(f"**Total Size:** {total_size_mb:.2f} MB")
+                st.write(f"**Total Chunks:** {total_chunks}")
+                
+                st.write("**File Types:**")
+                for file_type, count in file_types.items():
+                    st.write(f"  • {file_type.title()}: {count}")
+                
+                # Show recent files
+                recent_files = sorted(
+                    enhanced_metadata.items(),
+                    key=lambda x: x[1].get('processed_time', ''),
+                    reverse=True
+                )[:5]
+                
+                st.write("**Recently Processed:**")
+                for file_hash, file_data in recent_files:
+                    st.write(f"  • {file_data.get('file_name', 'Unknown')} ({file_data.get('file_type', 'unknown')})")
+        
         # Debug information
         with st.expander("🔧 Debug Info"):
             st.write(f"processed_pdfs: {st.session_state.processed_pdfs}")
@@ -1662,6 +2091,7 @@ def main():
             st.write(f"has_llm: {st.session_state.llm is not None}")
             st.write(f"pdf_chunks: {pdf_count}")
             st.write(f"sheet_chunks: {sheets_count}")
+            st.write(f"enhanced_metadata_files: {len(enhanced_metadata) if enhanced_metadata else 0}")
         
         st.markdown("---")
         st.header("ℹ️ About")
@@ -1674,6 +2104,8 @@ def main():
         
         **Supports:** PDF files, Google Docs, Excel files, and Google Sheets
         """)
+        
+
     
     # Main content area
     if not st.session_state.processed_pdfs and not st.session_state.processed_sheets and not st.session_state.start_chatting:
@@ -1732,12 +2164,24 @@ def main():
                     has_llm = st.session_state.llm is not None
                     
                     if has_unified_retriever and has_llm:
-                        # Use unified query system
+                        # Classify the query first for debugging
+                        classification = classify_query(prompt)
+                        query_type = classification.get('classification', 'content')
+                        confidence = classification.get('confidence', 0.0)
+                        
+                        # Show classification info in debug mode
+                        with st.expander("🔍 Query Classification Info", expanded=False):
+                            st.write(f"**Query Type:** {query_type}")
+                            st.write(f"**Confidence:** {confidence:.2f}")
+                            st.write(f"**Reasoning:** {classification.get('reasoning', 'No reasoning')}")
+                        
+                        # Use unified query system with user email
                         answer = query_unified_system(
                             prompt, 
                             st.session_state.unified_retriever, 
                             st.session_state.llm,
-                            st.session_state.messages
+                            st.session_state.messages,
+                            user_email
                         )
                         
                         # Display response
