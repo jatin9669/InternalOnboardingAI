@@ -139,26 +139,36 @@ def fallback_query_classification(query):
     """
     query_lower = query.lower()
     
-    # Metadata keywords
+    # Metadata keywords (queries about file properties, structure, etc.)
     metadata_keywords = [
-        'how many', 'count', 'number of', 'files', 'documents',
-        'file type', 'file size', 'file name', 'file format',
+        'how many', 'count', 'number of', 'file type', 'file size', 'file name', 'file format',
         'when', 'date', 'time', 'modified', 'created', 'processed',
         'recent', 'oldest', 'newest', 'largest', 'smallest',
         'show me all', 'list', 'what files', 'which files',
-        'file properties', 'metadata', 'structure', 'organization'
+        'file properties', 'metadata', 'structure', 'organization',
+        'file count', 'document count', 'total files', 'file list'
     ]
     
-    # Content keywords
+    # Content keywords (queries about actual content, data, information)
     content_keywords = [
         'what does', 'what is', 'what are', 'find', 'search',
         'information about', 'data about', 'content', 'says',
         'explain', 'describe', 'analyze', 'summarize', 'key points',
-        'topics', 'subjects', 'details', 'facts', 'information'
+        'topics', 'subjects', 'details', 'facts', 'information',
+        'containing', 'with', 'about', 'reviews', 'products', 'companies',
+        'data', 'table', 'sheet', 'spreadsheet'
     ]
     
     metadata_score = sum(1 for keyword in metadata_keywords if keyword in query_lower)
     content_score = sum(1 for keyword in content_keywords if keyword in query_lower)
+    
+    # Special handling for queries that ask about content within files
+    if 'containing' in query_lower or 'with' in query_lower:
+        content_score += 2  # Boost content score for "containing" queries
+    
+    # Special handling for specific content types
+    if any(word in query_lower for word in ['reviews', 'products', 'companies', 'data', 'table']):
+        content_score += 1  # Boost content score for specific content types
     
     if metadata_score > content_score:
         return {
@@ -966,7 +976,7 @@ class UnifiedRetriever:
         self.sheets_index = sheets_index
         self.embeddings = embeddings
     
-    def retrieve_relevant_chunks(self, query, k_pdfs=20, k_sheets=5, chat_history=None):
+    def retrieve_relevant_chunks(self, query, k_pdfs=20, k_sheets=10, chat_history=None):
         """Retrieve relevant chunks from both PDFs/Docs and Sheets."""
         try:
             pdf_chunks = []
@@ -988,8 +998,8 @@ class UnifiedRetriever:
                 enhanced_query = f"Context from recent conversation:\n{context_summary}\n\nCurrent question: {query}"
                 print(f"🔍 Using enhanced query with conversation context")
             
-            # Detect if this is a sheet-specific query
-            sheet_keywords = ['sheet', 'spreadsheet', 'excel', 'table', 'data', 'company', 'revenue', 'employees', 'industry']
+            # Detect if this is a sheet-specific query (generic approach)
+            sheet_keywords = ['sheet', 'spreadsheet', 'excel', 'table', 'data']
             is_sheet_query = any(keyword in query.lower() for keyword in sheet_keywords)
             
             # Adjust retrieval parameters based on query type
@@ -1001,55 +1011,243 @@ class UnifiedRetriever:
             # Retrieve from PDFs/Docs vectorstore
             if self.pdf_vectorstore:
                 try:
-                    # First, try semantic search
-                    pdf_docs = self.pdf_vectorstore.similarity_search(enhanced_query, k=k_pdfs)
-                    pdf_chunks = [
-                        {
-                            'content': doc.page_content,
-                            'metadata': doc.metadata,
-                            'source_type': 'pdf_doc'
-                        }
-                        for doc in pdf_docs
-                    ]
+                    # Use hybrid search approach to avoid dominance by single documents
+                    print("🔍 Using hybrid search approach...")
+                    client = create_opensearch_client()
                     
-                    # If no results or if we're looking for a specific document, try keyword search
-                    if not pdf_chunks or any(keyword in enhanced_query.lower() for keyword in ['rag test', 'shades consti']):
-                        print("🔍 Trying keyword search for specific documents...")
-                        # Use direct OpenSearch client for keyword search
-                        client = create_opensearch_client()
-                        
-                        # Search for specific document names
-                        keyword_results = client.search(
-                            index=OPENSEARCH_INDEX,
-                            body={
-                                'query': {
-                                    'bool': {
-                                        'should': [
-                                            {'match': {'text': enhanced_query}},
-                                            {'match': {'metadata.source': 'RAG test'}},
-                                            {'match': {'metadata.source': 'Shades Consti.pdf'}}
-                                        ]
-                                    }
-                                },
-                                'size': k_pdfs
+                    # Extract key terms from the query
+                    query_terms = enhanced_query.lower().split()
+                    meaningful_terms = [term for term in query_terms if len(term) > 3 and term not in ['the', 'and', 'for', 'with', 'this', 'that', 'file', 'containing', 'has', 'includes', 'what', 'does', 'tell', 'me', 'about']]
+                    
+                    # Look for potential file names in the query
+                    potential_file_names = []
+                    for i, term in enumerate(query_terms):
+                        if term in ['pdf', 'document', 'file'] and i + 1 < len(query_terms):
+                            potential_file_names.append(query_terms[i + 1])
+                        elif term.endswith('.pdf') or term.endswith('.doc'):
+                            potential_file_names.append(term)
+                    
+                    # Extract potential document names from query using intelligent parsing
+                    # Look for patterns that might indicate document names
+                    query_words = enhanced_query.lower().split()
+                    
+                    # Check for file extensions
+                    for word in query_words:
+                        if word.endswith('.pdf') or word.endswith('.doc') or word.endswith('.docx'):
+                            potential_file_names.append(word)
+                    
+                    # Check for quoted strings (potential file names)
+                    import re
+                    quoted_names = re.findall(r'"([^"]+)"', enhanced_query)
+                    potential_file_names.extend(quoted_names)
+                    
+                    # Look for capitalized phrases that might be document names
+                    # Split by common separators and look for title-case patterns
+                    title_patterns = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', enhanced_query)
+                    for pattern in title_patterns:
+                        if len(pattern.split()) >= 2:  # At least 2 words for a document name
+                            potential_file_names.append(pattern)
+                    
+                    # Remove duplicates and filter out common words
+                    common_words = {'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'must', 'shall'}
+                    potential_file_names = [name for name in potential_file_names if name.lower() not in common_words]
+                    potential_file_names = list(set(potential_file_names))  # Remove duplicates
+                    
+                    print(f"🎯 Potential file names to search: {potential_file_names}")
+                    
+                    # Build hybrid search query
+                    search_queries = []
+                    
+                    # 1. Semantic search with query text
+                    search_queries.append({
+                        'match': {
+                            'text': {
+                                'query': enhanced_query,
+                                'boost': 1.0
                             }
-                        )
+                        }
+                    })
+                    
+                    # 2. Phrase matching for exact terms
+                    search_queries.append({
+                        'match_phrase': {
+                            'text': {
+                                'query': enhanced_query,
+                                'boost': 2.0
+                            }
+                        }
+                    })
+                    
+                    # 3. Boost specific file names if mentioned (using fuzzy matching)
+                    for file_name in potential_file_names:
+                        search_queries.append({
+                            'fuzzy': {
+                                'metadata.source': {
+                                    'value': file_name,
+                                    'fuzziness': 'AUTO',
+                                    'boost': 5.0  # High boost for file name matches
+                                }
+                            }
+                        })
+                        search_queries.append({
+                            'match_phrase': {
+                                'metadata.source': {
+                                    'query': file_name,
+                                    'boost': 10.0  # Very high boost for exact file name matches
+                                }
+                            }
+                        })
+                    
+                    # 4. Add fuzzy matching for document names in content
+                    for file_name in potential_file_names:
+                        search_queries.append({
+                            'fuzzy': {
+                                'text': {
+                                    'value': file_name,
+                                    'fuzziness': 'AUTO',
+                                    'boost': 3.0
+                                }
+                            }
+                        })
+                    
+                    # 5. Add meaningful term searches
+                    for term in meaningful_terms:
+                        search_queries.append({
+                            'match': {
+                                'text': {
+                                    'query': term,
+                                    'boost': 1.5
+                                }
+                            }
+                        })
+                    
+                    # 6. Add k-NN vector search for semantic similarity
+                    embedding = self.embeddings.embed_query(enhanced_query)
+                    search_queries.append({
+                        'knn': {
+                            'vector_field': {
+                                'vector': embedding,
+                                'k': k_pdfs * 2  # Get more candidates for diversity
+                            }
+                        }
+                    })
+                    
+                    # Execute hybrid search
+                    hybrid_results = client.search(
+                        index=OPENSEARCH_INDEX,
+                        body={
+                            'query': {
+                                'bool': {
+                                    'should': search_queries,
+                                    'minimum_should_match': 1
+                                }
+                            },
+                            'size': k_pdfs * 3,  # Get more results for diversity
+                            'collapse': {
+                                'field': 'metadata.source.keyword'  # Collapse by source to ensure diversity
+                            }
+                        }
+                    )
+                    
+                    # Process results and ensure diversity
+                    seen_sources = set()
+                    source_counts = {}
+                    
+                    for hit in hybrid_results['hits']['hits']:
+                        source = hit['_source']
+                        source_name = source['metadata']['source']
                         
-                        # Add keyword search results
-                        for hit in keyword_results['hits']['hits']:
-                            source = hit['_source']
+                        # Count how many chunks we have from this source
+                        current_count = source_counts.get(source_name, 0)
+                        
+                        # Limit to 3 chunks per source to ensure diversity
+                        if current_count < 3:
                             chunk = {
                                 'content': source['text'],
                                 'metadata': source['metadata'],
                                 'source_type': 'pdf_doc'
                             }
-                            # Avoid duplicates
-                            if not any(existing['content'] == chunk['content'] for existing in pdf_chunks):
-                                pdf_chunks.append(chunk)
+                            pdf_chunks.append(chunk)
+                            source_counts[source_name] = current_count + 1
+                            seen_sources.add(source_name)
+                            
+                            # Stop if we have enough total chunks
+                            if len(pdf_chunks) >= k_pdfs:
+                                break
                     
-                    print(f"📄 Retrieved {len(pdf_chunks)} PDF/Doc chunks")
+                    # If we still don't have enough results, try additional search strategies
+                    if len(pdf_chunks) < k_pdfs // 2:
+                        print("🔍 Trying additional search strategies...")
+                        
+                        # Strategy 1: Fall back to semantic search
+                        try:
+                            pdf_docs = self.pdf_vectorstore.similarity_search(enhanced_query, k=k_pdfs)
+                            for doc in pdf_docs:
+                                chunk = {
+                                    'content': doc.page_content,
+                                    'metadata': doc.metadata,
+                                    'source_type': 'pdf_doc'
+                                }
+                                if not any(existing['content'] == chunk['content'] for existing in pdf_chunks):
+                                    pdf_chunks.append(chunk)
+                        except Exception as e:
+                            print(f"⚠️ Semantic search fallback failed: {str(e)}")
+                        
+                        # Strategy 2: If we have potential file names but no results, try direct file search
+                        if potential_file_names and len(pdf_chunks) < k_pdfs // 2:
+                            print("🔍 Trying direct file name search...")
+                            for file_name in potential_file_names:
+                                try:
+                                    file_results = client.search(
+                                        index=OPENSEARCH_INDEX,
+                                        body={
+                                            'query': {
+                                                'bool': {
+                                                    'should': [
+                                                        {'fuzzy': {'metadata.source': {'value': file_name, 'fuzziness': 'AUTO'}}},
+                                                        {'match': {'metadata.source': file_name}},
+                                                        {'wildcard': {'metadata.source': f'*{file_name}*'}}
+                                                    ],
+                                                    'minimum_should_match': 1
+                                                }
+                                            },
+                                            'size': 5
+                                        }
+                                    )
+                                    
+                                    for hit in file_results['hits']['hits']:
+                                        source = hit['_source']
+                                        chunk = {
+                                            'content': source['text'],
+                                            'metadata': source['metadata'],
+                                            'source_type': 'pdf_doc'
+                                        }
+                                        if not any(existing['content'] == chunk['content'] for existing in pdf_chunks):
+                                            pdf_chunks.append(chunk)
+                                            
+                                        if len(pdf_chunks) >= k_pdfs:
+                                            break
+                                except Exception as e:
+                                    print(f"⚠️ File name search failed for '{file_name}': {str(e)}")
+                    
+                    print(f"📄 Retrieved {len(pdf_chunks)} PDF/Doc chunks from {len(seen_sources)} different sources")
+                    print(f"📋 Sources found: {list(seen_sources)}")
+                    print(f"📊 Source counts: {source_counts}")
                 except Exception as e:
                     print(f"❌ Error retrieving PDF chunks: {str(e)}")
+                    # Fallback to simple semantic search
+                    try:
+                        pdf_docs = self.pdf_vectorstore.similarity_search(enhanced_query, k=k_pdfs)
+                        pdf_chunks = [
+                            {
+                                'content': doc.page_content,
+                                'metadata': doc.metadata,
+                                'source_type': 'pdf_doc'
+                            }
+                            for doc in pdf_docs
+                        ]
+                    except Exception as fallback_error:
+                        print(f"❌ Fallback search also failed: {str(fallback_error)}")
             
             # Retrieve from Sheets index
             if self.sheets_index:
@@ -1059,20 +1257,28 @@ class UnifiedRetriever:
                         print("🔍 Using direct OpenSearch search for sheet data...")
                         client = create_opensearch_client()
                         
-                        # Search for sheet content directly
+                        # Extract key terms from the query for targeted search
+                        query_terms = enhanced_query.lower().split()
+                        # Filter out common words and keep meaningful terms
+                        meaningful_terms = [term for term in query_terms if len(term) > 3 and term not in ['the', 'and', 'for', 'with', 'this', 'that', 'file', 'containing', 'has', 'includes']]
+                        
+                        # Search for sheet content using hybrid approach
+                        search_queries = [
+                            {'match': {'content': enhanced_query}},
+                            {'match_phrase': {'content': enhanced_query}}
+                        ]
+                        
+                        # Add targeted searches for meaningful terms
+                        for term in meaningful_terms:
+                            search_queries.append({'match': {'content': term}})
+                        
                         sheet_results = client.search(
                             index=SHEETS_INDEX,
                             body={
                                 'query': {
                                     'bool': {
-                                        'should': [
-                                            {'match': {'content': enhanced_query}},
-                                            {'match': {'content': 'Company Name'}},
-                                            {'match': {'content': 'Industry'}},
-                                            {'match': {'content': 'Revenue'}},
-                                            {'match': {'metadata.source': 'RAG Test Data'}},
-                                            {'match': {'metadata.source': 'RAG Test Data.xlsx'}}
-                                        ]
+                                        'should': search_queries,
+                                        'minimum_should_match': 1
                                     }
                                 },
                                 'size': k_sheets
@@ -1119,6 +1325,50 @@ class UnifiedRetriever:
         except Exception as e:
             print(f"❌ Error in unified retrieval: {str(e)}")
             return [], []
+
+def create_mixed_query_response(pdf_chunks, sheets_chunks, query, llm, chat_history=None, user_email=None):
+    """Create a response for mixed queries that combines content search with metadata formatting."""
+    try:
+        # Get file metadata for the found chunks
+        enhanced_metadata = load_enhanced_file_metadata(user_email) if user_email else {}
+        
+        # Collect unique file sources from chunks
+        file_sources = set()
+        for chunk in pdf_chunks + sheets_chunks:
+            if isinstance(chunk, dict):
+                source = chunk.get('metadata', {}).get('source', 'Unknown')
+                file_sources.add(source)
+        
+        # Get metadata for each file source
+        file_metadata_list = []
+        for source in file_sources:
+            # Find metadata for this file
+            for file_hash, metadata in enhanced_metadata.items():
+                if metadata.get('file_name') == source:
+                    file_metadata_list.append(metadata)
+                    break
+        
+        # Create response with file metadata
+        if file_metadata_list:
+            response = f"**Files containing relevant content:**\n\n"
+            for i, file_meta in enumerate(file_metadata_list, 1):
+                file_name = file_meta.get('file_name', 'Unknown')
+                file_type = file_meta.get('file_type', 'Unknown')
+                web_link = file_meta.get('web_view_link', '')
+                file_size = file_meta.get('file_size_mb', 0)
+                
+                response += f"{i}. **{file_name}** ({file_type.title()})\n"
+                if web_link:
+                    response += f"   🔗 [View in Google Drive]({web_link})\n"
+                response += f"   📏 Size: {file_size:.2f} MB\n\n"
+        else:
+            response = "No files found containing the requested content."
+        
+        return response
+        
+    except Exception as e:
+        print(f"❌ Error creating mixed query response: {str(e)}")
+        return f"An error occurred while processing your query: {str(e)}"
 
 def create_unified_response(pdf_chunks, sheets_chunks, query, llm, chat_history=None):
     """Create a unified response using all retrieved chunks in a single LLM call."""
@@ -1939,12 +2189,21 @@ def query_unified_system(prompt, unified_retriever, llm, chat_history=None, user
         else:
             print("📄 Handling content query...")
             # Retrieve relevant chunks from both sources with history context
-            pdf_chunks, sheets_chunks = unified_retriever.retrieve_relevant_chunks(prompt, chat_history=chat_history)
+            pdf_chunks, sheets_chunks = unified_retriever.retrieve_relevant_chunks(prompt, k_pdfs=20, k_sheets=10, chat_history=chat_history)
             
             print(f"📄 Retrieved {len(pdf_chunks)} PDF chunks and {len(sheets_chunks)} sheet chunks")
             
-            # Create unified response in a single LLM call with history
-            response = create_unified_response(pdf_chunks, sheets_chunks, prompt, llm, chat_history)
+            # Check if this is a mixed query (content search + metadata response)
+            mixed_query_indicators = ["which file", "what file", "find the file", "show me the file", "which document", "what document"]
+            is_mixed_query = any(indicator in prompt.lower() for indicator in mixed_query_indicators)
+            
+            if is_mixed_query and user_email:
+                print("🔄 Detected mixed query - combining content search with metadata response...")
+                # Create content-based response but format it to show file metadata
+                response = create_mixed_query_response(pdf_chunks, sheets_chunks, prompt, llm, chat_history, user_email)
+            else:
+                # Create unified response in a single LLM call with history
+                response = create_unified_response(pdf_chunks, sheets_chunks, prompt, llm, chat_history)
         
         print("✅ Unified response generated successfully")
         return response
