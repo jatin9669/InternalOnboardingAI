@@ -1016,7 +1016,6 @@ class UnifiedRetriever:
                     if not pdf_chunks or any(keyword in enhanced_query.lower() for keyword in ['rag test', 'shades consti']):
                         print("🔍 Trying keyword search for specific documents...")
                         # Use direct OpenSearch client for keyword search
-                        from streamlit_app_drive_opensearch import create_opensearch_client, OPENSEARCH_INDEX
                         client = create_opensearch_client()
                         
                         # Search for specific document names
@@ -1058,7 +1057,6 @@ class UnifiedRetriever:
                     # For sheet-specific queries, also try direct OpenSearch search
                     if is_sheet_query:
                         print("🔍 Using direct OpenSearch search for sheet data...")
-                        from streamlit_app_drive_opensearch import create_opensearch_client, SHEETS_INDEX
                         client = create_opensearch_client()
                         
                         # Search for sheet content directly
