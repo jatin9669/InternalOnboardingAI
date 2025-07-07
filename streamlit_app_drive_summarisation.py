@@ -35,6 +35,7 @@ from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.chat_engine import CondenseQuestionChatEngine
 from llama_parse import LlamaParse
 import traceback
+from googleapiclient.errors import HttpError
 
 # Import spaCy metadata handler
 from spacy_metadata_handler import get_spacy_metadata_handler, QueryClassification
@@ -58,7 +59,11 @@ SHEETS_INDEX = 'sheets_embeddings'
 # Google OAuth configuration
 SCOPES = [
     'openid',
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/drive.activity',
     'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/drive.activity.readonly',
+    'https://www.googleapis.com/auth/drive.metadata',
     'https://www.googleapis.com/auth/userinfo.email',
     'https://www.googleapis.com/auth/userinfo.profile'
 ]
@@ -190,7 +195,7 @@ def get_user_enhanced_metadata_path(user_email):
 
 def save_enhanced_file_metadata(file_metadata, user_email):
     """Save comprehensive metadata about processed files to both JSON and OpenSearch."""
-    # Save to JSON file (for backward compatibility)
+    # Save to JSON file
     metadata_path = get_user_enhanced_metadata_path(user_email)
     os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
     
@@ -235,6 +240,251 @@ def load_enhanced_file_metadata(user_email):
             return {}
     return {}
 
+def delete_file_from_enhanced_metadata(file_name, user_email):
+    """Delete a file entry from the enhanced metadata JSON file."""
+    try:
+        metadata_path = get_user_enhanced_metadata_path(user_email)
+        if not os.path.exists(metadata_path):
+            return False
+        
+        # Load existing metadata
+        with open(metadata_path, 'r') as f:
+            enhanced_metadata = json.load(f)
+        
+        # Find and delete the file entry
+        file_hash_to_delete = None
+        for file_hash, metadata in enhanced_metadata.items():
+            if metadata.get('file_name') == file_name:
+                file_hash_to_delete = file_hash
+                break
+        
+        if file_hash_to_delete:
+            del enhanced_metadata[file_hash_to_delete]
+            
+            # Save updated metadata
+            with open(metadata_path, 'w') as f:
+                json.dump(enhanced_metadata, f, indent=2)
+            
+            print(f"✅ Deleted {file_name} from enhanced metadata")
+            return True
+        else:
+            print(f"⚠️ File {file_name} not found in enhanced metadata")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error deleting file from enhanced metadata: {str(e)}")
+        return False
+
+def delete_chunks_from_opensearch_by_filename(file_name, index_name=OPENSEARCH_INDEX):
+    """Delete all chunks from OpenSearch index that belong to a specific file."""
+    try:
+        client = create_opensearch_client()
+        if not client:
+            print("❌ Failed to create OpenSearch client")
+            return False
+        
+        # Check if index exists
+        if not client.indices.exists(index=index_name):
+            print(f"❌ Index {index_name} does not exist")
+            return False
+        
+        # Delete documents by file name in metadata
+        delete_query = {
+            "query": {
+                "match": {
+                    "metadata.source": file_name
+                }
+            }
+        }
+        
+        response = client.delete_by_query(
+            index=index_name,
+            body=delete_query
+        )
+        
+        deleted_count = response.get('deleted', 0)
+        print(f"✅ Deleted {deleted_count} chunks for file '{file_name}' from {index_name}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error deleting chunks from OpenSearch: {str(e)}")
+        return False
+
+def delete_metadata_from_opensearch_by_filename(file_name, user_email):
+    """Delete metadata from OpenSearch metadata index for a specific file."""
+    try:
+        # Get spaCy metadata handler
+        spacy_handler = get_spacy_metadata_handler()
+        if not spacy_handler or not spacy_handler.opensearch_client:
+            print("❌ spaCy metadata handler or OpenSearch client not available")
+            return False
+        
+        client = spacy_handler.opensearch_client
+        
+        # Check if metadata index exists
+        if not client.indices.exists(index="file_metadata"):
+            print("❌ Metadata index does not exist")
+            return False
+        
+        # Delete documents by file name and user email
+        delete_query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"user_email": user_email}},
+                        {"match": {"file_name": file_name}}
+                    ]
+                }
+            }
+        }
+        
+        response = client.delete_by_query(
+            index="file_metadata",
+            body=delete_query
+        )
+        
+        deleted_count = response.get('deleted', 0)
+        print(f"✅ Deleted {deleted_count} metadata entries for file '{file_name}' from metadata index")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error deleting metadata from OpenSearch: {str(e)}")
+        return False
+
+def delete_metadata_from_opensearch_by_file_id(file_id, user_email):
+    """Delete metadata from OpenSearch metadata index for a specific file by file_id."""
+    try:
+        # Get spaCy metadata handler
+        spacy_handler = get_spacy_metadata_handler()
+        if not spacy_handler or not spacy_handler.opensearch_client:
+            print("❌ spaCy metadata handler or OpenSearch client not available")
+            return False
+        
+        client = spacy_handler.opensearch_client
+        
+        # Check if metadata index exists
+        if not client.indices.exists(index="file_metadata"):
+            print("❌ Metadata index does not exist")
+            return False
+        
+        # Delete documents by file_id and user email
+        delete_query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {"user_email": user_email}},
+                        {"term": {"file_id": file_id}}
+                    ]
+                }
+            }
+        }
+        
+        response = client.delete_by_query(
+            index="file_metadata",
+            body=delete_query
+        )
+        
+        deleted_count = response.get('deleted', 0)
+        print(f"✅ Deleted {deleted_count} metadata entries for file_id '{file_id}' from metadata index")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error deleting metadata from OpenSearch: {str(e)}")
+        return False
+
+def check_file_modification(file_info, user_email):
+    """
+    Check if a file has been modified since last processing.
+    
+    Args:
+        file_info (dict): Current file information from Google Drive
+        user_email (str): User's email
+        
+    Returns:
+        tuple: (is_modified, existing_metadata) where is_modified is bool and existing_metadata is dict or None
+    """
+    try:
+        file_id = file_info['id']
+        file_name = file_info['name']
+        current_modified_time = file_info.get('modifiedTime', '')
+        
+        # Load enhanced metadata
+        enhanced_metadata = load_enhanced_file_metadata(user_email)
+        
+        # Find existing metadata for this file by file_id
+        existing_metadata = None
+        existing_file_hash = None
+        
+        for file_hash, metadata in enhanced_metadata.items():
+            if metadata.get('file_id') == file_id:
+                existing_metadata = metadata
+                existing_file_hash = file_hash
+                break
+        
+        if existing_metadata:
+            stored_modified_time = existing_metadata.get('modified_time', '')
+            
+            # Compare modification times
+            if current_modified_time != stored_modified_time:
+                print(f"🔄 File '{file_name}' has been modified:")
+                print(f"   Old modified time: {stored_modified_time}")
+                print(f"   New modified time: {current_modified_time}")
+                return True, existing_metadata
+            else:
+                print(f"✅ File '{file_name}' is up to date")
+                return False, existing_metadata
+        else:
+            print(f"🆕 File '{file_name}' is new (not previously processed)")
+            return False, None
+            
+    except Exception as e:
+        print(f"❌ Error checking file modification: {str(e)}")
+        return False, None
+
+def cleanup_modified_file(file_name, user_email, file_id=None):
+    """
+    Clean up a modified file by deleting its chunks from vector databases and metadata.
+    
+    Args:
+        file_name (str): Name of the file to cleanup
+        user_email (str): User's email
+        file_id (str, optional): File ID for more precise metadata cleanup
+        
+    Returns:
+        bool: True if cleanup was successful
+    """
+    try:
+        print(f"🧹 Cleaning up modified file: {file_name}")
+        
+        # Delete chunks from PDF/Docs index
+        pdf_cleanup_success = delete_chunks_from_opensearch_by_filename(file_name, OPENSEARCH_INDEX)
+        
+        # Delete chunks from sheets index
+        sheets_cleanup_success = delete_chunks_from_opensearch_by_filename(file_name, SHEETS_INDEX)
+        
+        # Delete from enhanced metadata JSON file
+        enhanced_metadata_cleanup_success = delete_file_from_enhanced_metadata(file_name, user_email)
+        
+        # Delete from OpenSearch metadata index
+        metadata_index_cleanup_success = False
+        if file_id:
+            # Use file_id for more precise cleanup
+            metadata_index_cleanup_success = delete_metadata_from_opensearch_by_file_id(file_id, user_email)
+        else:
+            # Fallback to filename-based cleanup
+            metadata_index_cleanup_success = delete_metadata_from_opensearch_by_filename(file_name, user_email)
+        
+        if pdf_cleanup_success or sheets_cleanup_success or enhanced_metadata_cleanup_success or metadata_index_cleanup_success:
+            print(f"✅ Cleanup completed for {file_name}")
+            return True
+        else:
+            print(f"⚠️ No cleanup actions were performed for {file_name}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error during file cleanup: {str(e)}")
+        return False
+
 def extract_file_metadata(file_info, file_type, additional_info=None):
     """
     Extract comprehensive metadata from a file.
@@ -275,7 +525,10 @@ def extract_file_metadata(file_info, file_type, additional_info=None):
         "image_media_metadata": file_info.get('imageMediaMetadata', {}),
         "video_media_metadata": file_info.get('videoMediaMetadata', {}),
         "processing_status": "completed",
-        "processing_errors": []
+        "processing_errors": [],
+        # Add revision information fields
+        "revisions": [],
+        "revision_count": 0
     }
     
     # Add file-type specific metadata
@@ -911,30 +1164,6 @@ def get_user_vectorstore_path(user_email):
     user_hash = hashlib.md5(user_email.encode()).hexdigest()
     return f"vectorstores/user_{user_hash}"
 
-def get_user_metadata_path(user_email):
-    """Get user-specific metadata path for tracking processed files."""
-    user_hash = hashlib.md5(user_email.encode()).hexdigest()
-    return f"vectorstores/user_{user_hash}_metadata.json"
-
-def save_processed_files_metadata(file_metadata, user_email):
-    """Save metadata about processed files."""
-    metadata_path = get_user_metadata_path(user_email)
-    os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
-    with open(metadata_path, 'w') as f:
-        json.dump(file_metadata, f, indent=2)
-
-def load_processed_files_metadata(user_email):
-    """Load metadata about previously processed files."""
-    metadata_path = get_user_metadata_path(user_email)
-    if os.path.exists(metadata_path):
-        try:
-            with open(metadata_path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"Failed to load metadata: {e}")
-            return {}
-    return {}
-
 def initialize_llamaindex_parser():
     """Initialize the LlamaParse parser for sheets processing."""
     try:
@@ -1545,9 +1774,6 @@ def process_all_user_documents_unified(credentials, user_email):
         if not client.indices.exists(index=SHEETS_INDEX):
             create_opensearch_index(client, SHEETS_INDEX)
 
-        # Load previously processed files metadata
-        processed_files = load_processed_files_metadata(user_email)
-        
         # Scan for PDFs, Google Docs, and Sheets
         st.session_state.processing_status = "📁 Scanning your Google Drive for PDF, Google Doc, and Sheet files..."
         
@@ -1557,6 +1783,9 @@ def process_all_user_documents_unified(credentials, user_email):
         
         all_files = pdf_files + doc_files + sheet_files
         st.session_state.processing_status = f"📊 Found {len(pdf_files)} PDF files, {len(doc_files)} Google Doc files, and {len(sheet_files)} Sheet files in your Drive"
+        
+        # Clean up files that have been deleted from Google Drive
+        deleted_files_cleaned = cleanup_deleted_files_from_metadata(all_files, user_email)
         
         if not all_files:
             st.warning("No PDF, Google Doc, or Sheet files found in your Google Drive.")
@@ -1587,6 +1816,7 @@ def process_all_user_documents_unified(credentials, user_email):
         processed_count = 0
         failed_count = 0
         skipped_count = 0
+        modified_count = 0
         
         print(f"🔍 Processing {len(pdf_files)} PDF files, {len(doc_files)} Google Doc files, and {len(sheet_files)} Sheet files")
         
@@ -1595,9 +1825,14 @@ def process_all_user_documents_unified(credentials, user_email):
             file_id = pdf_file['id']
             file_name = pdf_file['name']
             
-            # Check if already processed
-            file_hash = hashlib.md5(f"{file_id}_{pdf_file.get('modifiedTime', '')}".encode()).hexdigest()
-            if file_hash in processed_files:
+            # Check if file has been modified
+            is_modified, existing_metadata = check_file_modification(pdf_file, user_email)
+            
+            if is_modified:
+                print(f"🔄 File '{file_name}' has been modified, cleaning up old data...")
+                cleanup_modified_file(file_name, user_email, file_id)
+                modified_count += 1
+            elif existing_metadata:
                 print(f"⏭️ Skipping already processed PDF: {file_name}")
                 skipped_count += 1
                 continue
@@ -1617,15 +1852,7 @@ def process_all_user_documents_unified(credentials, user_email):
                     if pdf_docs:
                         documents.extend(pdf_docs)
                         processed_count += 1
-                        
-                        # Save metadata
-                        processed_files[file_hash] = {
-                            'file_id': file_id,
-                            'file_name': file_name,
-                            'file_type': 'pdf',
-                            'processed_time': datetime.now().isoformat(),
-                            'document_count': len(pdf_docs)
-                        }
+                        print(f"✅ Successfully processed {file_name}: {len(pdf_docs)} documents")
                     else:
                         failed_count += 1
                         
@@ -1638,9 +1865,14 @@ def process_all_user_documents_unified(credentials, user_email):
             file_id = doc_file['id']
             file_name = doc_file['name']
             
-            # Check if already processed
-            file_hash = hashlib.md5(f"{file_id}_{doc_file.get('modifiedTime', '')}".encode()).hexdigest()
-            if file_hash in processed_files:
+            # Check if file has been modified
+            is_modified, existing_metadata = check_file_modification(doc_file, user_email)
+            
+            if is_modified:
+                print(f"🔄 File '{file_name}' has been modified, cleaning up old data...")
+                cleanup_modified_file(file_name, user_email, file_id)
+                modified_count += 1
+            elif existing_metadata:
                 print(f"⏭️ Skipping already processed Google Doc: {file_name}")
                 skipped_count += 1
                 continue
@@ -1653,15 +1885,9 @@ def process_all_user_documents_unified(credentials, user_email):
                 if doc:
                     documents.append(doc)
                     processed_count += 1
-                    
-                    # Save metadata
-                    processed_files[file_hash] = {
-                        'file_id': file_id,
-                        'file_name': file_name,
-                        'file_type': 'google_doc',
-                        'processed_time': datetime.now().isoformat(),
-                        'document_count': 1
-                    }
+                    print(f"✅ Successfully processed {file_name}: 1 document")
+                    # Process revisions (metadata only)
+                    process_file_revisions(service, doc_file, user_email)
                 else:
                     failed_count += 1
                     
@@ -1674,9 +1900,14 @@ def process_all_user_documents_unified(credentials, user_email):
             file_id = sheet_file['id']
             file_name = sheet_file['name']
             
-            # Check if already processed
-            file_hash = hashlib.md5(f"{file_id}_{sheet_file.get('modifiedTime', '')}".encode()).hexdigest()
-            if file_hash in processed_files:
+            # Check if file has been modified
+            is_modified, existing_metadata = check_file_modification(sheet_file, user_email)
+            
+            if is_modified:
+                print(f"🔄 File '{file_name}' has been modified, cleaning up old data...")
+                cleanup_modified_file(file_name, user_email, file_id)
+                modified_count += 1
+            elif existing_metadata:
                 print(f"⏭️ Skipping already processed Sheet: {file_name}")
                 skipped_count += 1
                 continue
@@ -1717,17 +1948,12 @@ def process_all_user_documents_unified(credentials, user_email):
                                     }
                                     
                                     # Store enhanced metadata
+                                    file_hash = hashlib.md5(f"{file_id}_{sheet_file.get('modifiedTime', '')}".encode()).hexdigest()
                                     enhanced_metadata = extract_file_metadata(sheet_file, 'sheet', additional_info)
                                     save_enhanced_file_metadata({file_hash: enhanced_metadata}, user_email)
                                     
-                                    # Save metadata
-                                    processed_files[file_hash] = {
-                                        'file_id': file_id,
-                                        'file_name': file_name,
-                                        'file_type': 'sheet',
-                                        'processed_time': datetime.now().isoformat(),
-                                        'document_count': len(sheet_documents)
-                                    }
+                                    # Process revisions (metadata only)
+                                    process_file_revisions(service, sheet_file, user_email)
                                 else:
                                     print(f"⚠️ No documents extracted from {file_name}")
                                     failed_count += 1
@@ -1747,7 +1973,10 @@ def process_all_user_documents_unified(credentials, user_email):
         
         # Process documents with LangChain (PDFs and Google Docs)
         if documents:
-            st.success(f"✅ Successfully processed {processed_count} files ({failed_count} failed)")
+            success_message = f"✅ Successfully processed {processed_count} files ({failed_count} failed, {modified_count} modified)"
+            if deleted_files_cleaned > 0:
+                success_message += f", cleaned up {deleted_files_cleaned} deleted files"
+            st.success(success_message)
             st.info("🧠 Creating embeddings for documents...")
             
             # Create embeddings using Gemini
@@ -1833,11 +2062,11 @@ def process_all_user_documents_unified(credentials, user_email):
             except Exception as e:
                 st.error(f"❌ Error creating unified retriever: {str(e)}")
         
-        # Save updated metadata
-        save_processed_files_metadata(processed_files, user_email)
-        
         # Update session state
-        st.session_state.processing_status = "✅ Processing complete! You can now ask questions about your documents and sheets."
+        status_message = "✅ Processing complete! You can now ask questions about your documents and sheets."
+        if deleted_files_cleaned > 0:
+            status_message += f" (Cleaned up {deleted_files_cleaned} deleted files)"
+        st.session_state.processing_status = status_message
         
     except Exception as e:
         st.error(f"Error processing documents: {str(e)}")
@@ -2212,6 +2441,62 @@ def query_unified_system(prompt, unified_retriever, llm, chat_history=None, user
         print(f"❌ Error in unified query system: {str(e)}")
         return f"An error occurred while processing your query: {str(e)}"
 
+def process_file_revisions(service, file_info, user_email):
+    """
+    Fetch and process revisions for a Google Doc or Sheet file.
+    - Stores revision metadata as part of the file's comprehensive metadata
+    - Does NOT create separate content chunks for revisions
+    """
+    file_id = file_info['id']
+    file_name = file_info['name']
+    mime_type = file_info.get('mimeType', '')
+    file_type = 'google_doc' if mime_type == 'application/vnd.google-apps.document' else (
+        'sheet' if mime_type == 'application/vnd.google-apps.spreadsheet' else None)
+    if not file_type:
+        return  # Only process Google Docs/Sheets
+
+    try:
+        revisions = service.revisions().list(fileId=file_id, fields="revisions(id, modifiedTime, size, keepForever, originalFilename, mimeType, lastModifyingUser)").execute().get('revisions', [])
+        # Only process the 5 most recent revisions for efficiency
+        revisions = sorted(revisions, key=lambda r: r.get('modifiedTime', ''), reverse=True)
+        
+        revision_list = []
+        for rev in revisions:
+            rev_info = {
+                'revision_id': rev.get('id'),
+                'revision_modified_time': rev.get('modifiedTime', ''),
+                'revision_size': rev.get('size', ''),
+                'revision_keep_forever': rev.get('keepForever', False),
+                'revision_original_filename': rev.get('originalFilename', ''),
+                'revision_mime_type': rev.get('mimeType', ''),
+                'last_modifying_user': rev.get('lastModifyingUser', {})
+            }
+            revision_list.append(rev_info)
+        
+        # Update the file's metadata with revision information
+        file_hash = hashlib.md5(f"{file_id}_{file_info.get('modifiedTime', '')}".encode()).hexdigest()
+        
+        # Load existing metadata
+        enhanced_metadata = load_enhanced_file_metadata(user_email)
+        if file_hash in enhanced_metadata:
+            # Update existing metadata with revision info
+            enhanced_metadata[file_hash]['revisions'] = revision_list
+            enhanced_metadata[file_hash]['revision_count'] = len(revision_list)
+        else:
+            # Create new metadata entry with revision info
+            file_metadata = extract_file_metadata(file_info, file_type)
+            file_metadata['revisions'] = revision_list
+            file_metadata['revision_count'] = len(revision_list)
+            enhanced_metadata[file_hash] = file_metadata
+        
+        # Save updated metadata
+        save_enhanced_file_metadata(enhanced_metadata, user_email)
+        
+        print(f"✅ Added {len(revision_list)} revisions to metadata for {file_name}")
+        
+    except Exception as e:
+        print(f"Error processing revisions for {file_name}: {str(e)}")
+
 def main():
     st.set_page_config(
         page_title="Unified AI Document Assistant",
@@ -2299,11 +2584,6 @@ def main():
         
         if force_reprocess:
             if st.button("🗑️ Clear All Data", type="secondary"):
-                # Clear processed files metadata
-                metadata_path = get_user_metadata_path(user_email)
-                if os.path.exists(metadata_path):
-                    os.remove(metadata_path)
-                
                 # Clear enhanced metadata
                 enhanced_metadata_path = get_user_enhanced_metadata_path(user_email)
                 if os.path.exists(enhanced_metadata_path):
@@ -2498,6 +2778,82 @@ def main():
         if st.button("🗑️ Clear Chat History"):
             st.session_state.messages = []
             st.rerun()
+
+def cleanup_deleted_files_from_metadata(drive_files, user_email):
+    """
+    Clean up files that exist in metadata but are no longer present in Google Drive.
+    
+    Args:
+        drive_files (list): List of file info dictionaries from Google Drive
+        user_email (str): User's email
+        
+    Returns:
+        int: Number of files cleaned up
+    """
+    try:
+        print("🔍 Checking for files that have been deleted from Google Drive...")
+        
+        # Load enhanced metadata
+        enhanced_metadata = load_enhanced_file_metadata(user_email)
+        if not enhanced_metadata:
+            print("✅ No metadata found, nothing to clean up")
+            return 0
+        
+        # Get all file IDs from Google Drive
+        drive_file_ids = {file['id'] for file in drive_files}
+        
+        # Find files in metadata that are no longer in Drive
+        files_to_cleanup = []
+        for file_hash, metadata in enhanced_metadata.items():
+            file_id = metadata.get('file_id')
+            file_name = metadata.get('file_name')
+            
+            if file_id and file_id not in drive_file_ids:
+                files_to_cleanup.append({
+                    'file_id': file_id,
+                    'file_name': file_name,
+                    'file_hash': file_hash
+                })
+        
+        if not files_to_cleanup:
+            print("✅ All files in metadata are still present in Google Drive")
+            return 0
+        
+        print(f"🗑️ Found {len(files_to_cleanup)} files that have been deleted from Google Drive")
+        
+        # Clean up each deleted file
+        cleaned_count = 0
+        for file_info in files_to_cleanup:
+            file_id = file_info['file_id']
+            file_name = file_info['file_name']
+            file_hash = file_info['file_hash']
+            
+            print(f"🧹 Cleaning up deleted file: {file_name} (ID: {file_id})")
+            
+            # Delete chunks from PDF/Docs index
+            pdf_cleanup_success = delete_chunks_from_opensearch_by_filename(file_name, OPENSEARCH_INDEX)
+            
+            # Delete chunks from sheets index
+            sheets_cleanup_success = delete_chunks_from_opensearch_by_filename(file_name, SHEETS_INDEX)
+            
+            # Delete from enhanced metadata JSON file
+            enhanced_metadata_cleanup_success = delete_file_from_enhanced_metadata(file_name, user_email)
+            
+            # Delete from OpenSearch metadata index
+            metadata_index_cleanup_success = delete_metadata_from_opensearch_by_file_id(file_id, user_email)
+            
+            if pdf_cleanup_success or sheets_cleanup_success or enhanced_metadata_cleanup_success or metadata_index_cleanup_success:
+                print(f"✅ Cleanup completed for deleted file: {file_name}")
+                cleaned_count += 1
+            else:
+                print(f"⚠️ No cleanup actions were performed for deleted file: {file_name}")
+        
+        print(f"✅ Cleaned up {cleaned_count} deleted files from all indexes and metadata")
+        return cleaned_count
+        
+    except Exception as e:
+        print(f"❌ Error cleaning up deleted files: {str(e)}")
+        return 0
 
 if __name__ == "__main__":
     main() 
