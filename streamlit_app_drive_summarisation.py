@@ -1,6 +1,5 @@
 import streamlit as st
 import os
-import pickle
 import fitz  # PyMuPDF for PDF processing
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -20,9 +19,6 @@ from google_auth_oauthlib.flow import Flow
 import hashlib
 import json
 from datetime import datetime
-import uuid
-import base64
-from PIL import Image
 import io
 from image_processor import init_gemini, process_pdf_images
 
@@ -69,26 +65,22 @@ SCOPES = [
 ]
 
 # Initialize session state
-if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
-if 'user_info' not in st.session_state:
-    st.session_state.user_info = None
-if 'credentials' not in st.session_state:
-    st.session_state.credentials = None
-if 'processed_pdfs' not in st.session_state:
-    st.session_state.processed_pdfs = False
-if 'processed_sheets' not in st.session_state:
-    st.session_state.processed_sheets = False
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
-if 'unified_retriever' not in st.session_state:
-    st.session_state.unified_retriever = None
-if 'llm' not in st.session_state:
-    st.session_state.llm = None
-if 'processing_status' not in st.session_state:
-    st.session_state.processing_status = ""
-if 'start_chatting' not in st.session_state:
-    st.session_state.start_chatting = False
+session_defaults = {
+    'authenticated': False,
+    'user_info': None,
+    'credentials': None,
+    'processed_pdfs': False,
+    'processed_sheets': False,
+    'chat_history': [],
+    'unified_retriever': None,
+    'llm': None,
+    'processing_status': "",
+    'start_chatting': False
+}
+
+for key, default_value in session_defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = default_value
 
 print("🚀 Unified Document Assistant initialized")
 
@@ -275,122 +267,71 @@ def delete_file_from_enhanced_metadata(file_name, user_email):
         print(f"❌ Error deleting file from enhanced metadata: {str(e)}")
         return False
 
-def delete_chunks_from_opensearch_by_filename(file_name, index_name=OPENSEARCH_INDEX):
-    """Delete all chunks from OpenSearch index that belong to a specific file."""
+def delete_from_opensearch(index_name, query, user_email=None, operation_name="documents"):
+    """Generic function to delete documents from OpenSearch based on query."""
     try:
-        client = create_opensearch_client()
-        if not client:
-            print("❌ Failed to create OpenSearch client")
-            return False
+        # Determine which client to use
+        if index_name == "file_metadata":
+            # Use spaCy metadata handler client
+            spacy_handler = get_spacy_metadata_handler()
+            if not spacy_handler or not spacy_handler.opensearch_client:
+                print("❌ spaCy metadata handler or OpenSearch client not available")
+                return False
+            client = spacy_handler.opensearch_client
+        else:
+            # Use regular OpenSearch client
+            client = create_opensearch_client()
+            if not client:
+                print("❌ Failed to create OpenSearch client")
+                return False
         
         # Check if index exists
         if not client.indices.exists(index=index_name):
             print(f"❌ Index {index_name} does not exist")
             return False
         
-        # Delete documents by file name in metadata
-        delete_query = {
-            "query": {
-                "match": {
-                    "metadata.source": file_name
-                }
-            }
-        }
-        
+        # Execute deletion
         response = client.delete_by_query(
             index=index_name,
-            body=delete_query
+            body={"query": query}
         )
         
         deleted_count = response.get('deleted', 0)
-        print(f"✅ Deleted {deleted_count} chunks for file '{file_name}' from {index_name}")
+        print(f"✅ Deleted {deleted_count} {operation_name} from {index_name}")
         return True
         
     except Exception as e:
-        print(f"❌ Error deleting chunks from OpenSearch: {str(e)}")
+        print(f"❌ Error deleting {operation_name} from OpenSearch: {str(e)}")
         return False
+
+def delete_chunks_from_opensearch_by_filename(file_name, index_name=OPENSEARCH_INDEX):
+    """Delete all chunks from OpenSearch index that belong to a specific file."""
+    query = {"match": {"metadata.source": file_name}}
+    return delete_from_opensearch(index_name, query, operation_name=f"chunks for file '{file_name}'")
 
 def delete_metadata_from_opensearch_by_filename(file_name, user_email):
     """Delete metadata from OpenSearch metadata index for a specific file."""
-    try:
-        # Get spaCy metadata handler
-        spacy_handler = get_spacy_metadata_handler()
-        if not spacy_handler or not spacy_handler.opensearch_client:
-            print("❌ spaCy metadata handler or OpenSearch client not available")
-            return False
-        
-        client = spacy_handler.opensearch_client
-        
-        # Check if metadata index exists
-        if not client.indices.exists(index="file_metadata"):
-            print("❌ Metadata index does not exist")
-            return False
-        
-        # Delete documents by file name and user email
-        delete_query = {
-            "query": {
-                "bool": {
-                    "must": [
-                        {"term": {"user_email": user_email}},
-                        {"match": {"file_name": file_name}}
-                    ]
-                }
-            }
+    query = {
+        "bool": {
+            "must": [
+                {"term": {"user_email": user_email}},
+                {"match": {"file_name": file_name}}
+            ]
         }
-        
-        response = client.delete_by_query(
-            index="file_metadata",
-            body=delete_query
-        )
-        
-        deleted_count = response.get('deleted', 0)
-        print(f"✅ Deleted {deleted_count} metadata entries for file '{file_name}' from metadata index")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error deleting metadata from OpenSearch: {str(e)}")
-        return False
+    }
+    return delete_from_opensearch("file_metadata", query, user_email, f"metadata entries for file '{file_name}'")
 
 def delete_metadata_from_opensearch_by_file_id(file_id, user_email):
     """Delete metadata from OpenSearch metadata index for a specific file by file_id."""
-    try:
-        # Get spaCy metadata handler
-        spacy_handler = get_spacy_metadata_handler()
-        if not spacy_handler or not spacy_handler.opensearch_client:
-            print("❌ spaCy metadata handler or OpenSearch client not available")
-            return False
-        
-        client = spacy_handler.opensearch_client
-        
-        # Check if metadata index exists
-        if not client.indices.exists(index="file_metadata"):
-            print("❌ Metadata index does not exist")
-            return False
-        
-        # Delete documents by file_id and user email
-        delete_query = {
-            "query": {
-                "bool": {
-                    "must": [
-                        {"term": {"user_email": user_email}},
-                        {"term": {"file_id": file_id}}
-                    ]
-                }
-            }
+    query = {
+        "bool": {
+            "must": [
+                {"term": {"user_email": user_email}},
+                {"term": {"file_id": file_id}}
+            ]
         }
-        
-        response = client.delete_by_query(
-            index="file_metadata",
-            body=delete_query
-        )
-        
-        deleted_count = response.get('deleted', 0)
-        print(f"✅ Deleted {deleted_count} metadata entries for file_id '{file_id}' from metadata index")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error deleting metadata from OpenSearch: {str(e)}")
-        return False
+    }
+    return delete_from_opensearch("file_metadata", query, user_email, f"metadata entries for file_id '{file_id}'")
 
 def check_file_modification(file_info, user_email):
     """
@@ -706,34 +647,37 @@ def get_document_count(index_name=OPENSEARCH_INDEX):
     except Exception as e:
         print(f"❌ Error getting document count: {str(e)}")
         return 0
-
+def get_google_client_config():
+    """Get Google OAuth client configuration."""
+    return {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "redirect_uris": ["http://localhost:8501"]
+        }
+    }
+def create_oauth_flow():
+    """Create OAuth flow with proper configuration."""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise ValueError("Google OAuth credentials not found in environment variables")
+    
+    client_config = get_google_client_config()
+    
+    # Configure flow with insecure transport for local development
+    flow = Flow.from_client_config(
+        client_config, 
+        SCOPES,
+        redirect_uri="http://localhost:8501"
+    )
+    
+    return flow
 def get_google_oauth_url():
     """Generate Google OAuth URL for authentication."""
     try:
-        # Validate environment variables
-        if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-            raise ValueError("Google OAuth credentials not found in environment variables")
-        
-        client_config = {
-            "web": {
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                "redirect_uris": ["http://localhost:8501"]
-            }
-        }
-        
-        # Configure flow with insecure transport for local development
-        flow = Flow.from_client_config(
-            client_config, 
-            SCOPES,
-            redirect_uri="http://localhost:8501"
-        )
-        
-        # Set additional flow properties
-        flow.redirect_uri = "http://localhost:8501"
+        flow = create_oauth_flow()
         
         auth_url, _ = flow.authorization_url(
             access_type='offline',
@@ -753,30 +697,9 @@ def get_google_oauth_url():
 def authenticate_with_google(callback_url):
     """Authenticate user with Google using callback URL."""
     try:
-        # Re-create flow if not in session state
+        # Get or create flow
         if 'oauth_flow' not in st.session_state:
-            # Recreate the flow
-            if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-                st.error("Google OAuth credentials not found in environment variables")
-                return None, None
-            
-            client_config = {
-                "web": {
-                    "client_id": GOOGLE_CLIENT_ID,
-                    "client_secret": GOOGLE_CLIENT_SECRET,
-                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-                    "redirect_uris": ["http://localhost:8501"]
-                }
-            }
-            
-            # Configure flow with insecure transport for local development
-            flow = Flow.from_client_config(
-                client_config, 
-                SCOPES,
-                redirect_uri="http://localhost:8501"
-            )
+            flow = create_oauth_flow()
             st.session_state.oauth_flow = flow
         else:
             flow = st.session_state.oauth_flow
@@ -809,144 +732,104 @@ def authenticate_with_google(callback_url):
         st.error(f"Authentication failed: {str(e)}")
         return None, None
 
-def scan_entire_drive_for_pdfs(credentials):
-    """Scan entire Google Drive for PDF files."""
+def scan_drive_for_files(credentials, mime_types, file_type_name="files"):
+    """Generic function to scan Google Drive for files with specified MIME types."""
     try:
         service = build('drive', 'v3', credentials=credentials)
-        
-        # Query to find all PDF files
-        query = "mimeType='application/pdf' and trashed=false"
-        
         results = []
-        page_token = None
         
-        while True:
-            response = service.files().list(
-                q=query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, viewedByMeTime, owners, permissions, webViewLink, webContentLink, thumbnailLink, parents, trashed, starred, shared, viewedByMe, capabilities, exportLinks, appProperties, properties, imageMediaMetadata, videoMediaMetadata)',
-                pageToken=page_token
-            ).execute()
+        # Handle multiple MIME types (for sheets)
+        if isinstance(mime_types, str):
+            mime_types = [mime_types]
+        
+        for mime_type in mime_types:
+            query = f"mimeType='{mime_type}' and trashed=false"
+            page_token = None
             
-            results.extend(response.get('files', []))
-            page_token = response.get('nextPageToken', None)
-            
-            if page_token is None:
-                break
+            while True:
+                response = service.files().list(
+                    q=query,
+                    spaces='drive',
+                    fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, viewedByMeTime, owners, permissions, webViewLink, webContentLink, thumbnailLink, parents, trashed, starred, shared, viewedByMe, capabilities, exportLinks, appProperties, properties, imageMediaMetadata, videoMediaMetadata)',
+                    pageToken=page_token
+                ).execute()
+                
+                results.extend(response.get('files', []))
+                page_token = response.get('nextPageToken', None)
+                
+                if page_token is None:
+                    break
         
         return results
         
     except Exception as e:
-        st.error(f"Error scanning Drive for PDFs: {str(e)}")
+        st.error(f"Error scanning Drive for {file_type_name}: {str(e)}")
         return []
+
+def scan_entire_drive_for_pdfs(credentials):
+    """Scan entire Google Drive for PDF files."""
+    return scan_drive_for_files(credentials, "application/pdf", "PDFs")
 
 def scan_entire_drive_for_docs(credentials):
     """Scan entire Google Drive for Google Docs files."""
-    try:
-        service = build('drive', 'v3', credentials=credentials)
-        
-        # Query to find all Google Docs files
-        query = "mimeType='application/vnd.google-apps.document' and trashed=false"
-        
-        results = []
-        page_token = None
-        
-        while True:
-            response = service.files().list(
-                q=query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, viewedByMeTime, owners, permissions, webViewLink, webContentLink, thumbnailLink, parents, trashed, starred, shared, viewedByMe, capabilities, exportLinks, appProperties, properties, imageMediaMetadata, videoMediaMetadata)',
-                pageToken=page_token
-            ).execute()
-            
-            results.extend(response.get('files', []))
-            page_token = response.get('nextPageToken', None)
-            
-            if page_token is None:
-                break
-        
-        return results
-        
-    except Exception as e:
-        st.error(f"Error scanning Drive for Google Docs: {str(e)}")
-        return []
+    return scan_drive_for_files(credentials, "application/vnd.google-apps.document", "Google Docs")
 
 def scan_entire_drive_for_sheets(credentials):
     """Scan entire Google Drive for Excel and Google Sheets files."""
-    try:
-        service = build('drive', 'v3', credentials=credentials)
-        
-        # Query to find Excel files and Google Sheets
-        excel_query = "mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' and trashed=false"
-        google_sheets_query = "mimeType='application/vnd.google-apps.spreadsheet' and trashed=false"
-        
-        results = []
-        
-        # Get Excel files
-        page_token = None
-        while True:
-            response = service.files().list(
-                q=excel_query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, viewedByMeTime, owners, permissions, webViewLink, webContentLink, thumbnailLink, parents, trashed, starred, shared, viewedByMe, capabilities, exportLinks, appProperties, properties, imageMediaMetadata, videoMediaMetadata)',
-                pageToken=page_token
-            ).execute()
-            
-            results.extend(response.get('files', []))
-            page_token = response.get('nextPageToken', None)
-            
-            if page_token is None:
-                break
-        
-        # Get Google Sheets
-        page_token = None
-        while True:
-            response = service.files().list(
-                q=google_sheets_query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, viewedByMeTime, owners, permissions, webViewLink, webContentLink, thumbnailLink, parents, trashed, starred, shared, viewedByMe, capabilities, exportLinks, appProperties, properties, imageMediaMetadata, videoMediaMetadata)',
-                pageToken=page_token
-            ).execute()
-            
-            results.extend(response.get('files', []))
-            page_token = response.get('nextPageToken', None)
-            
-            if page_token is None:
-                break
-        
-        return results
-        
-    except Exception as e:
-        st.error(f"Error scanning Drive for sheets: {str(e)}")
-        return []
+    mime_types = [
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.google-apps.spreadsheet"
+    ]
+    return scan_drive_for_files(credentials, mime_types, "sheets")
 
-def download_pdf_from_drive(service, file_id, file_name, download_dir):
-    """Download a single PDF file from Google Drive."""
+def download_file_from_drive(service, file_id, file_name, download_dir, file_type="file", export_mime_type=None):
+    """Generic function to download files from Google Drive."""
     try:
-        request = service.files().get_media(fileId=file_id)
-        file_path = os.path.join(download_dir, f"{file_id}_{file_name}")
+        # Determine request type
+        if export_mime_type:
+            # Export file (for Google Docs/Sheets)
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType=export_mime_type
+            )
+        else:
+            # Direct download
+            request = service.files().get_media(fileId=file_id)
         
+        # Determine file path
+        if file_type == "sheet" and not file_name.endswith('.xlsx'):
+            file_path = os.path.join(download_dir, f"{file_id}_{file_name}.xlsx")
+        else:
+            file_path = os.path.join(download_dir, f"{file_id}_{file_name}")
+        
+        # Download to file
         with open(file_path, 'wb') as f:
             downloader = MediaIoBaseDownload(f, request)
             done = False
             while done is False:
                 status, done = downloader.next_chunk()
+                if status and file_type == "google_doc":
+                    print(f"Download {int(status.progress() * 100)}%")
         
         return file_path
+        
     except Exception as e:
         print(f"Failed to download {file_name}: {str(e)}")
         return None
 
+def download_pdf_from_drive(service, file_id, file_name, download_dir):
+    """Download a single PDF file from Google Drive."""
+    return download_file_from_drive(service, file_id, file_name, download_dir, "pdf")
+
 def download_google_doc_content(service, file_id, file_name, file_info=None):
     """Download Google Doc content as text."""
     try:
-        # Export Google Doc as plain text
+        # Download content to memory
         request = service.files().export_media(
             fileId=file_id,
             mimeType='text/plain'
         )
         
-        # Download the content
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, request)
         done = False
@@ -1003,31 +886,12 @@ def download_google_doc_content(service, file_id, file_name, file_info=None):
 
 def download_sheet_from_drive(service, file_id, file_name, download_dir):
     """Download a sheet file from Google Drive."""
-    try:
-        # For Excel files, download directly
-        if file_name.endswith(('.xlsx', '.xls')):
-            request = service.files().get_media(fileId=file_id)
-        else:
-            # For Google Sheets, export as Excel
-            request = service.files().export_media(
-                fileId=file_id,
-                mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
-        
-        file_path = os.path.join(download_dir, f"{file_id}_{file_name}")
-        if not file_path.endswith('.xlsx'):
-            file_path += '.xlsx'
-        
-        with open(file_path, 'wb') as f:
-            downloader = MediaIoBaseDownload(f, request)
-            done = False
-            while done is False:
-                status, done = downloader.next_chunk()
-        
-        return file_path
-    except Exception as e:
-        print(f"Failed to download {file_name}: {str(e)}")
-        return None
+    # For Excel files, download directly; for Google Sheets, export as Excel
+    export_mime_type = None
+    if not file_name.endswith(('.xlsx', '.xls')):
+        export_mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    
+    return download_file_from_drive(service, file_id, file_name, download_dir, "sheet", export_mime_type)
 
 def extract_text_with_links(pdf_path):
     """Extract text and hyperlinks from a PDF."""
@@ -1159,43 +1023,58 @@ def process_pdf_with_images(pdf_path, file_name, file_id, file_info=None):
         traceback.print_exc()
         return None
 
-def get_user_vectorstore_path(user_email):
-    """Get user-specific vectorstore path."""
-    user_hash = hashlib.md5(user_email.encode()).hexdigest()
-    return f"vectorstores/user_{user_hash}"
 
+
+class LlamaIndexConfig:
+    """Configuration class for LlamaIndex components."""
+    
+    @staticmethod
+    def _get_api_key(env_var, component_name):
+        """Get API key from environment variable."""
+        api_key = os.getenv(env_var)
+        if not api_key:
+            raise ValueError(f"{env_var} not found in environment variables")
+        return api_key
+    
+    @staticmethod
+    def initialize_parser():
+        """Initialize the LlamaParse parser for sheets processing."""
+        try:
+            llama_key = LlamaIndexConfig._get_api_key("LLAMA_CLOUD_API_KEY", "LlamaParse")
+            return LlamaParse(api_key=llama_key, result_type="markdown")
+        except Exception as e:
+            print(f"Error initializing LlamaParse: {str(e)}")
+            return None
+    
+    @staticmethod
+    def initialize_llm():
+        """Initialize the Google GenAI LLM for LlamaIndex."""
+        try:
+            google_api_key = LlamaIndexConfig._get_api_key("GOOGLE_API_KEY", "LlamaIndex LLM")
+            return GoogleGenAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0.3)
+        except Exception as e:
+            print(f"Error initializing LlamaIndex LLM: {str(e)}")
+            return None
+    
+    @staticmethod
+    def initialize_embeddings():
+        """Initialize the Google GenAI Embeddings for LlamaIndex."""
+        try:
+            google_api_key = LlamaIndexConfig._get_api_key("GOOGLE_API_KEY", "LlamaIndex embeddings")
+            return GoogleGenAIEmbedding(model_name="embedding-001", api_key=google_api_key)
+        except Exception as e:
+            print(f"Error initializing LlamaIndex embeddings: {str(e)}")
+            return None
+
+# Backward compatibility aliases
 def initialize_llamaindex_parser():
-    """Initialize the LlamaParse parser for sheets processing."""
-    try:
-        llama_key = os.getenv("LLAMA_CLOUD_API_KEY")
-        if not llama_key:
-            raise ValueError("LLAMA_CLOUD_API_KEY not found in environment variables")
-        return LlamaParse(api_key=llama_key, result_type="markdown")
-    except Exception as e:
-        print(f"Error initializing LlamaParse: {str(e)}")
-        return None
+    return LlamaIndexConfig.initialize_parser()
 
 def initialize_llamaindex_llm():
-    """Initialize the Google GenAI LLM for LlamaIndex."""
-    try:
-        google_api_key = os.getenv("GOOGLE_API_KEY")
-        if not google_api_key:
-            raise ValueError("GOOGLE_API_KEY not found in environment variables")
-        return GoogleGenAI(model="gemini-2.5-flash", api_key=google_api_key, temperature=0.3)
-    except Exception as e:
-        print(f"Error initializing LlamaIndex LLM: {str(e)}")
-        return None
+    return LlamaIndexConfig.initialize_llm()
 
 def initialize_llamaindex_embeddings():
-    """Initialize the Google GenAI Embeddings for LlamaIndex."""
-    try:
-        google_api_key = os.getenv("GOOGLE_API_KEY")
-        if not google_api_key:
-            raise ValueError("GOOGLE_API_KEY not found in environment variables")
-        return GoogleGenAIEmbedding(model_name="embedding-001", api_key=google_api_key)
-    except Exception as e:
-        print(f"Error initializing LlamaIndex embeddings: {str(e)}")
-        return None
+    return LlamaIndexConfig.initialize_embeddings()
 
 class UnifiedRetriever:
     """Unified retriever that fetches relevant chunks from both PDFs/Docs and Sheets."""
@@ -1649,10 +1528,11 @@ def create_unified_response(pdf_chunks, sheets_chunks, query, llm, chat_history=
         # Create unified prompt with strict guidelines
         unified_prompt = f"""# 🤖 UNIFIED AI DOCUMENT ASSISTANT
 
-You are an advanced AI assistant with comprehensive access to information from both documents/PDFs and spreadsheets/Excel files. Your role is to provide accurate, well-structured, and contextually relevant responses based solely on the provided information.
+You are an advanced AI assistant with comprehensive access to information from both documents/PDFs and 
+spreadsheets/Excel files. Your role is to provide accurate, well-structured, and contextually relevant 
+responses based solely on the provided information.
 
 ## 📋 CORE RESPONSIBILITIES
-
 ### 🎯 Primary Objectives
 - **Answer questions accurately** using only the provided context
 - **Cite sources properly** by mentioning document names and content types
@@ -1666,28 +1546,21 @@ You are an advanced AI assistant with comprehensive access to information from b
 - **Metadata**: File sources, page numbers, and processing timestamps
 
 ## 📊 CONTEXT INFORMATION
-
 ### 📄 DOCUMENTS & PDFS
 {pdf_context}
-
 ### 📈 SPREADSHEETS & EXCEL FILES
 {sheets_context}
-
 ### 💬 CONVERSATION HISTORY
 {history_context}
-
 ## 🎨 VISUAL CONTENT GUIDELINES
 
 ### 🔍 Image-Related Keywords to Monitor
 **Visual Elements:**
 - image, picture, photo, screenshot, diagram, chart, graph, logo, icon
-
 **Descriptive Terms:**
 - visual, appearance, look like, show, display, depict, illustrate
-
 **Interface Elements:**
 - dashboard, interface, UI, layout, design, mockup, wireframe
-
 **Technical Specifications:**
 - color, style, format, size, dimensions, resolution
 
@@ -1699,7 +1572,6 @@ You are an advanced AI assistant with comprehensive access to information from b
 5. **Fallback Handling**: If visual content is requested but not found, clearly state this
 
 ## 🔗 URL AND LINK HANDLING
-
 ### 📎 Link Management
 - **Always include URLs** when present in the context
 - **Format as clickable links** using proper markdown syntax
@@ -1707,7 +1579,6 @@ You are an advanced AI assistant with comprehensive access to information from b
 - **Maintain link integrity** throughout the response
 
 ## 📝 RESPONSE STRUCTURE GUIDELINES
-
 ### 🎯 Answer Format
 1. **Direct Response**: Provide a clear, concise answer to the user's question
 2. **Source Citation**: Reference document names and content types (text/image)
@@ -1722,7 +1593,6 @@ You are an advanced AI assistant with comprehensive access to information from b
 - **Trend Identification**: Highlight patterns and relationships in the data
 
 ## ⚠️ STRICT COMPLIANCE RULES
-
 ### 🚫 Prohibited Actions
 - **Never answer from personal knowledge** - use only provided context
 - **No speculation** about information not present in the context
@@ -1736,19 +1606,14 @@ You are an advanced AI assistant with comprehensive access to information from b
 - **Clearly state** when information is not available in the context
 
 ## 🎯 CURRENT QUERY
-
 **USER QUESTION:** {query}
-
 ## 📤 RESPONSE GENERATION
-
 Based on the comprehensive context provided above, generate a well-structured response that:
-
 1. **Directly addresses** the user's question
 2. **Integrates information** from all relevant sources (text, images, spreadsheets)
 3. **Maintains conversation continuity** using the provided history
 4. **Follows all formatting and citation guidelines**
 5. **Provides actionable insights** when applicable
-
 **ANSWER:**"""
 
         # Get response from LLM using complete method for raw strings
